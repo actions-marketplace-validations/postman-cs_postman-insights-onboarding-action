@@ -20958,6 +20958,310 @@ function getIDToken(aud) {
   });
 }
 
+// src/lib/credential-identity.ts
+var sessionPath = "/api/sessions/current";
+var pmakMemo = /* @__PURE__ */ new Map();
+var sessionMemo = /* @__PURE__ */ new Map();
+var memoizedSessionIdentity;
+function getMemoizedSessionIdentity() {
+  return memoizedSessionIdentity;
+}
+function asRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return void 0;
+  }
+  return value;
+}
+function coerceId(raw) {
+  return raw ? String(raw) : void 0;
+}
+function coerceText(raw) {
+  if (typeof raw !== "string") {
+    return void 0;
+  }
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : void 0;
+}
+function normalizeBaseUrl(raw) {
+  return String(raw || "").replace(/\/+$/, "");
+}
+async function resolvePmakIdentity(opts) {
+  const apiKey = String(opts.apiKey || "").trim();
+  if (!apiKey) {
+    return void 0;
+  }
+  const baseUrl = normalizeBaseUrl(opts.apiBaseUrl);
+  const memoKey = `${baseUrl}::${apiKey}`;
+  let pending = pmakMemo.get(memoKey);
+  if (!pending) {
+    pending = probePmakIdentity(baseUrl, apiKey, opts.fetchImpl ?? fetch);
+    pmakMemo.set(memoKey, pending);
+  }
+  return pending;
+}
+async function probePmakIdentity(baseUrl, apiKey, fetchImpl) {
+  try {
+    const response = await fetchImpl(`${baseUrl}/me`, {
+      method: "GET",
+      headers: { "X-Api-Key": apiKey }
+    });
+    if (!response.ok) {
+      return void 0;
+    }
+    const payload = asRecord(await response.json());
+    const user = asRecord(payload?.user);
+    if (!user) {
+      return void 0;
+    }
+    return {
+      source: "pmak/me",
+      userId: coerceId(user.id),
+      fullName: coerceText(user.fullName) ?? coerceText(user.username),
+      teamId: coerceId(user.teamId),
+      teamName: coerceText(user.teamName),
+      teamDomain: coerceText(user.teamDomain)
+    };
+  } catch {
+    return void 0;
+  }
+}
+async function resolveSessionIdentity(opts) {
+  const accessToken = String(opts.accessToken || "").trim();
+  if (!accessToken) {
+    return void 0;
+  }
+  const baseUrl = normalizeBaseUrl(opts.iapubBaseUrl);
+  const memoKey = `${baseUrl}::${accessToken}`;
+  let pending = sessionMemo.get(memoKey);
+  if (!pending) {
+    pending = probeSessionIdentity(baseUrl, accessToken, opts.fetchImpl ?? fetch);
+    sessionMemo.set(memoKey, pending);
+  }
+  return pending;
+}
+async function probeSessionIdentity(baseUrl, accessToken, fetchImpl) {
+  try {
+    const response = await fetchImpl(`${baseUrl}${sessionPath}`, {
+      method: "GET",
+      headers: { "x-access-token": accessToken }
+    });
+    if (!response.ok) {
+      return void 0;
+    }
+    const payload = asRecord(await response.json());
+    if (!payload) {
+      return void 0;
+    }
+    const identity = asRecord(payload.identity);
+    const data = asRecord(payload.data);
+    const user = asRecord(data?.user);
+    const roleEntries = Array.isArray(user?.roles) ? user.roles.map((entry) => coerceText(entry) ?? coerceId(entry)).filter((entry) => Boolean(entry)) : [];
+    const singleRole = coerceText(user?.role);
+    const roles = roleEntries.length > 0 ? roleEntries : singleRole ? [singleRole] : void 0;
+    const resolved = {
+      source: "iapub/sessions",
+      userId: coerceId(user?.id),
+      fullName: coerceText(user?.fullName) ?? coerceText(user?.name) ?? coerceText(user?.username),
+      teamId: coerceId(identity?.team),
+      teamDomain: coerceText(identity?.domain),
+      ...roles ? { roles } : {},
+      consumerType: coerceText(payload.consumerType) ?? coerceText(data?.consumerType) ?? coerceText(user?.consumerType)
+    };
+    memoizedSessionIdentity = resolved;
+    return resolved;
+  } catch {
+    return void 0;
+  }
+}
+function describeTeam(id) {
+  const label = id?.teamName ?? id?.teamDomain;
+  return `team ${id?.teamId ?? "unresolved"}${label ? ` (${label})` : ""}`;
+}
+function formatIdentityLine(id, mask) {
+  const teamPart = id.teamId ? describeTeam(id) : "team unresolved";
+  const domainPart = id.teamDomain ? `, domain ${id.teamDomain}` : "";
+  if (id.source === "pmak/me") {
+    const userPart = id.userId ? `user ${id.userId}${id.fullName ? ` (${id.fullName})` : ""}, ` : "";
+    return mask(`postman: PMAK identity - ${userPart}${teamPart}${domainPart}`);
+  }
+  return mask(
+    `postman: access-token session identity - ${teamPart}${domainPart} [source: iapub/sessions]`
+  );
+}
+function crossCheckIdentities(args) {
+  if (args.mode === "off") {
+    return { ok: true, level: "ok", message: "" };
+  }
+  const pmakTeamId = args.pmak?.teamId;
+  const sessionTeamId = args.session?.teamId;
+  if (pmakTeamId && sessionTeamId && pmakTeamId !== sessionTeamId) {
+    const level = args.mode === "enforce" ? "fail" : "note";
+    const lead = level === "fail" ? "credential preflight FAILED" : "credential preflight note";
+    const fix = level === "fail" ? "Use one credential pair from a single parent org: re-mint the access token from the same parent org as postman-api-key (postman-resolve-service-token-action, or POST https://api.getpostman.com/service-account-tokens with that team's PMAK), or set postman-api-key to the matching parent org." : "Use one credential pair from a single parent org. Set credential-preflight: enforce to fail the run on this condition.";
+    return {
+      ok: false,
+      level,
+      message: args.mask(
+        `postman: ${lead} - PMAK belongs to ${describeTeam(args.pmak)} but the access token's session belongs to a different parent org, ${describeTeam(args.session)}. Assets would be created against one team while Bifrost linking and governance act under the other, producing duplicate-link 400s and workspaces not visible to the other credential. ` + fix
+      )
+    };
+  }
+  if (pmakTeamId && sessionTeamId) {
+    const scope = args.workspaceTeamId || args.explicitTeamId ? "parent org team" : "team";
+    const label = args.pmak?.teamName ?? args.pmak?.teamDomain ?? args.session?.teamName ?? args.session?.teamDomain;
+    return {
+      ok: true,
+      level: "ok",
+      message: args.mask(
+        `postman: credential preflight OK - PMAK and access token both resolve to ${scope} ${pmakTeamId}${label ? ` (${label})` : ""}`
+      )
+    };
+  }
+  const missing = [
+    !pmakTeamId ? "PMAK identity" : void 0,
+    !sessionTeamId ? "access-token session identity" : void 0
+  ].filter(Boolean).join(" and ");
+  return {
+    ok: false,
+    level: "note",
+    message: args.mask(
+      `postman: credential preflight note - cross-check skipped because the ${missing} did not resolve a team id; continuing with reactive error guidance only`
+    )
+  };
+}
+async function runCredentialPreflight(args) {
+  if (args.mode === "off") {
+    return;
+  }
+  const mask = args.mask;
+  const apiKey = String(args.postmanApiKey || "").trim();
+  const accessToken = String(args.postmanAccessToken || "").trim();
+  let pmak = args.pmak;
+  if (pmak) {
+    args.log.info(formatIdentityLine(pmak, mask));
+  } else if (apiKey) {
+    try {
+      pmak = await resolvePmakIdentity({
+        apiBaseUrl: args.apiBaseUrl,
+        apiKey,
+        fetchImpl: args.fetchImpl
+      });
+    } catch (error2) {
+      args.log.warning(
+        mask(
+          `postman: credential preflight could not resolve PMAK identity: ${error2 instanceof Error ? error2.message : String(error2)}`
+        )
+      );
+    }
+    if (pmak) {
+      args.log.info(formatIdentityLine(pmak, mask));
+    } else {
+      args.log.warning(
+        mask("postman: credential preflight could not resolve PMAK identity from GET /me; continuing")
+      );
+    }
+  }
+  if (!accessToken) {
+    args.log.info(mask("postman: Bifrost diagnostics limited: no access token"));
+    return;
+  }
+  let session;
+  try {
+    session = await resolveSessionIdentity({
+      iapubBaseUrl: args.iapubBaseUrl,
+      accessToken,
+      fetchImpl: args.fetchImpl
+    });
+  } catch (error2) {
+    args.log.warning(
+      mask(
+        `postman: credential preflight could not resolve access-token session identity: ${error2 instanceof Error ? error2.message : String(error2)}`
+      )
+    );
+  }
+  if (session) {
+    args.log.info(formatIdentityLine(session, mask));
+  } else {
+    args.log.warning(
+      mask(
+        "postman: credential preflight could not resolve the access-token session identity from iapub; continuing with reactive error guidance only"
+      )
+    );
+  }
+  const result = crossCheckIdentities({
+    pmak,
+    session,
+    workspaceTeamId: args.workspaceTeamId,
+    explicitTeamId: args.explicitTeamId,
+    mode: args.mode,
+    mask
+  });
+  if (!result.message) {
+    return;
+  }
+  if (result.level === "fail") {
+    throw new Error(result.message);
+  }
+  if (result.level === "note") {
+    args.log.warning(result.message);
+    return;
+  }
+  args.log.info(result.message);
+}
+
+// src/lib/error-advice.ts
+var WORKSPACE_PERSONAL_ONLY_ADVICE = "Workspace creation failed: This may be an Org-mode account that requires a workspace-team-id input. The Postman API does not allow creating team workspaces at the organization level. Use the workspace-team-id input to specify which sub-team should own this workspace.";
+function expiryAdvice(code) {
+  return `postman: Bifrost rejected the access token (${code}). Service-account access tokens expire after about 1 to 1.5 hours; this run likely outlived its token. Re-mint a fresh token (postman-resolve-service-token-action, or POST https://api.getpostman.com/service-account-tokens) and re-run. If it was just minted, confirm postman-access-token is the token for the same parent org as postman-api-key.`;
+}
+function forbiddenAdvice(ctx) {
+  const sessionDetail = ctx.sessionTeamId ? ` while the access token is valid (it resolved to team ${ctx.sessionTeamId}${ctx.sessionRoles && ctx.sessionRoles.length > 0 ? `, roles [${ctx.sessionRoles.join(", ")}]` : ""}${ctx.sessionConsumerType ? `, consumerType ${ctx.sessionConsumerType}` : ""} at preflight)` : "";
+  const scopedTeamId = ctx.workspaceTeamId || ctx.explicitTeamId;
+  const teamClause = scopedTeamId ? `, or workspace-team-id ${scopedTeamId} names a sub-team it cannot act in` : ", or the workspace-team-id / POSTMAN_TEAM_ID in use names a sub-team it cannot act in";
+  return `postman: Bifrost refused ${ctx.operation || "this operation"} with 403${sessionDetail}. The token's identity lacks permission for this endpoint${teamClause}. Verify the token's role and that workspace-team-id / POSTMAN_TEAM_ID matches a sub-team from GET https://api.getpostman.com/teams.`;
+}
+function buildAdvice(status, body, ctx) {
+  if (body.includes("UNAUTHENTICATED")) {
+    return expiryAdvice("UNAUTHENTICATED");
+  }
+  if (body.includes("authenticationError")) {
+    return expiryAdvice("authenticationError");
+  }
+  if (body.includes("Only personal workspaces")) {
+    return WORKSPACE_PERSONAL_ONLY_ADVICE;
+  }
+  if (body.includes("projectAlreadyConnected")) {
+    return `postman: ${ctx.operation || "this operation"} reports projectAlreadyConnected with no workspace id in the error body. The repository is already linked to a workspace this credential cannot see, usually one created by a different credential pair or sub-team. Delete the stale link or its workspace, then re-run with one credential pair from a single parent org.`;
+  }
+  if (body.includes("invalidParamError") && body.includes("already exists")) {
+    return `postman: ${ctx.operation || "this operation"} hit a duplicate resource error (invalidParamError: already exists). A matching resource already exists, possibly under another credential pair or sub-team where this credential cannot see it. Identify which workspace holds the existing resource and re-run with one credential pair from a single parent org.`;
+  }
+  if (body.includes("Team feature is not available for your organization")) {
+    return `postman: ${ctx.operation || "this operation"} failed because the team feature is not available for this organization. The credential belongs to an account whose plan lacks team features; use credentials from the intended team and confirm the plan supports this operation.`;
+  }
+  if (body.includes("You are not authorized to perform this action") || status === 403 && ctx.hasAccessToken) {
+    return forbiddenAdvice(ctx);
+  }
+  return void 0;
+}
+function adviseFromHttpError(err, ctx) {
+  const body = err.responseBody || err.message || "";
+  const advice = buildAdvice(err.status, body, ctx);
+  if (!advice) {
+    return void 0;
+  }
+  return new Error(ctx.mask(advice), { cause: err });
+}
+function adviseFromBifrostBody(status, body, ctx) {
+  const advice = buildAdvice(status, String(body || ""), ctx);
+  if (!advice) {
+    return void 0;
+  }
+  return new Error(ctx.mask(advice), {
+    cause: new Error(ctx.mask(`HTTP ${status}: ${String(body || "").slice(0, 800)}`))
+  });
+}
+
 // src/lib/secrets.ts
 var REDACTED = "[REDACTED]";
 var SENSITIVE_HEADER_NAMES = /* @__PURE__ */ new Set([
@@ -21009,6 +21313,9 @@ function redactSecrets(input, secretValues, replacement = REDACTED) {
     }
     return sanitized.split(secret).join(replacement);
   }, source);
+}
+function createSecretMasker(secretValues, replacement = REDACTED) {
+  return (input) => redactSecrets(input, secretValues, replacement);
 }
 function headerEntries(headers) {
   if (headers instanceof Headers) {
@@ -21141,12 +21448,14 @@ var POSTMAN_ENDPOINT_PROFILES = {
   prod: {
     apiBaseUrl: "https://api.getpostman.com",
     bifrostBaseUrl: "https://bifrost-premium-https-v4.gw.postman.com",
+    iapubBaseUrl: "https://iapub.postman.co",
     observabilityBaseUrl: "https://api.observability.postman.com",
     observabilityEnv: "production"
   },
   beta: {
     apiBaseUrl: "https://api.getpostman-beta.com",
     bifrostBaseUrl: "https://bifrost-https-v4.gw.postman-beta.com",
+    iapubBaseUrl: "https://iapub.postman.co",
     observabilityBaseUrl: "https://api.observability.postman-beta.com",
     observabilityEnv: "beta"
   }
@@ -21210,7 +21519,23 @@ var BifrostCatalogClient = class {
     }
     return h;
   }
-  async proxyRequest(method, path7, body = {}) {
+  /**
+   * Reactive error-advice context. The session identity comes from the credential
+   * preflight's in-process memo when it ran; the advice degrades gracefully without it.
+   */
+  adviceContext(operation) {
+    const session = getMemoizedSessionIdentity();
+    return {
+      operation,
+      hasAccessToken: Boolean(this.accessToken),
+      sessionTeamId: session?.teamId,
+      sessionRoles: session?.roles,
+      sessionConsumerType: session?.consumerType,
+      explicitTeamId: this.teamId || void 0,
+      mask: createSecretMasker(this.secretValues)
+    };
+  }
+  async proxyRequest(method, path7, body = {}, operation = "api-catalog request") {
     const response = await this.fetchFn(this.bifrostProxyUrl, {
       method: "POST",
       headers: this.headers(),
@@ -21222,20 +21547,27 @@ var BifrostCatalogClient = class {
       })
     });
     if (!response.ok) {
-      throw await HttpError.fromResponse(response, {
+      const httpErr = await HttpError.fromResponse(response, {
         method: "POST",
         url: `bifrost:api-catalog:${method} ${path7}`,
         secretValues: this.secretValues
       });
+      const advised = adviseFromHttpError(httpErr, this.adviceContext(operation));
+      throw advised ?? httpErr;
     }
     const data = await response.json();
     if (data && typeof data === "object" && "error" in data && data.error) {
       const errObj = data.error;
-      throw new Error(`api-catalog error: ${errObj?.message || errObj?.code || "unknown"}`);
+      const advised = adviseFromBifrostBody(
+        response.status,
+        JSON.stringify({ error: errObj }),
+        this.adviceContext(operation)
+      );
+      throw advised ?? new Error(`api-catalog error: ${errObj?.message || errObj?.code || "unknown"}`);
     }
     return data;
   }
-  async akitaProxyRequest(method, path7, body = {}) {
+  async akitaProxyRequest(method, path7, body = {}, operation = "Insights request") {
     const response = await this.fetchFn(this.bifrostProxyUrl, {
       method: "POST",
       headers: this.headers(),
@@ -21248,7 +21580,10 @@ var BifrostCatalogClient = class {
     });
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      return { ok: false, status: response.status, data: null, errorText: text };
+      const advised = adviseFromBifrostBody(response.status, text, this.adviceContext(operation));
+      const errorText = advised ? text ? `${text}
+${advised.message}` : advised.message : text;
+      return { ok: false, status: response.status, data: null, errorText };
     }
     const data = await response.json();
     return { ok: true, status: response.status, data, errorText: "" };
@@ -21263,7 +21598,9 @@ var BifrostCatalogClient = class {
           const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
           const data = await this.proxyRequest(
             "GET",
-            `/api/v1/onboarding/discovered-services?status=discovered${cursorParam}`
+            `/api/v1/onboarding/discovered-services?status=discovered${cursorParam}`,
+            {},
+            "discovered-services listing"
           );
           allItems.push(...data.items || []);
           if (data.total && allItems.length >= data.total) {
@@ -21287,7 +21624,8 @@ var BifrostCatalogClient = class {
         const data = await this.proxyRequest(
           "POST",
           "/api/v1/onboarding/prepare-collection",
-          { service_id: String(serviceId), workspace_id: workspaceId }
+          { service_id: String(serviceId), workspace_id: workspaceId },
+          "collection preparation"
         );
         return data.id;
       },
@@ -21311,7 +21649,8 @@ var BifrostCatalogClient = class {
         await this.proxyRequest(
           "POST",
           "/api/v1/onboarding/git",
-          body
+          body,
+          "git onboarding"
         );
       },
       { maxAttempts: 2, delayMs: 3e3 }
@@ -21324,7 +21663,9 @@ var BifrostCatalogClient = class {
     for (let pageCount = 0; pageCount < MAX_PROVIDER_SERVICE_PAGES; pageCount += 1) {
       const result = await this.akitaProxyRequest(
         "GET",
-        `/v2/api-catalog/services?status=discovered&populate_endpoints=false&populate_discovery_metadata=true&page=${page}&page_size=${pageSize}`
+        `/v2/api-catalog/services?status=discovered&populate_endpoints=false&populate_discovery_metadata=true&page=${page}&page_size=${pageSize}`,
+        {},
+        "provider service resolution"
       );
       if (!result.ok || !result.data) return null;
       const services = result.data.services || [];
@@ -21354,7 +21695,8 @@ var BifrostCatalogClient = class {
           workspace_id: workspaceId,
           system_env: systemEnvironmentId
         }]
-      }
+      },
+      "Insights onboarding acknowledgment"
     );
     if (!result.ok) {
       throw new Error(`Insights acknowledge failed: ${result.status} ${result.errorText}`);
@@ -21363,7 +21705,9 @@ var BifrostCatalogClient = class {
   async acknowledgeWorkspace(workspaceId) {
     const result = await this.akitaProxyRequest(
       "POST",
-      `/v2/workspaces/${workspaceId}/onboarding/acknowledge`
+      `/v2/workspaces/${workspaceId}/onboarding/acknowledge`,
+      {},
+      "workspace onboarding acknowledgment"
     );
     if (!result.ok) {
       throw new Error(`Workspace acknowledge failed: ${result.status} ${result.errorText}`);
@@ -21383,18 +21727,22 @@ var BifrostCatalogClient = class {
       }
     );
     if (!response.ok) {
-      throw await HttpError.fromResponse(response, {
+      const httpErr = await HttpError.fromResponse(response, {
         method: "POST",
         url: `observability:createApplication(${workspaceId})`,
         secretValues: this.secretValues
       });
+      const advised = adviseFromHttpError(httpErr, this.adviceContext("application binding"));
+      throw advised ?? httpErr;
     }
     return response.json();
   }
   async getTeamVerificationToken(workspaceId) {
     const result = await this.akitaProxyRequest(
       "GET",
-      `/v2/workspaces/${workspaceId}/team-verification-token`
+      `/v2/workspaces/${workspaceId}/team-verification-token`,
+      {},
+      "team verification token retrieval"
     );
     if (!result.ok || !result.data) return null;
     return result.data.team_verification_token || null;
@@ -21411,11 +21759,13 @@ var BifrostCatalogClient = class {
       })
     });
     if (!response.ok) {
-      throw await HttpError.fromResponse(response, {
+      const httpErr = await HttpError.fromResponse(response, {
         method: "POST",
         url: "bifrost:identity:POST /api/keys",
         secretValues: this.secretValues
       });
+      const advised = adviseFromHttpError(httpErr, this.adviceContext("API key creation"));
+      throw advised ?? httpErr;
     }
     const data = await response.json();
     const apikey = data?.apikey;
@@ -21443,7 +21793,17 @@ var POLL_INTERVAL_DEFAULT = 10;
 var PROD_ENDPOINTS = resolvePostmanEndpointProfile("prod");
 var DEFAULT_POSTMAN_API_BASE = PROD_ENDPOINTS.apiBaseUrl;
 var DEFAULT_POSTMAN_BIFROST_BASE = PROD_ENDPOINTS.bifrostBaseUrl;
+var DEFAULT_POSTMAN_IAPUB_BASE = PROD_ENDPOINTS.iapubBaseUrl;
 var DEFAULT_POSTMAN_OBSERVABILITY_BASE = PROD_ENDPOINTS.observabilityBaseUrl;
+function parsePreflightMode(value) {
+  const normalized = String(value || "warn").trim().toLowerCase();
+  if (normalized === "enforce" || normalized === "warn" || normalized === "off") {
+    return normalized;
+  }
+  throw new Error(
+    `Unsupported credential-preflight "${value}". Supported values: enforce, warn, off`
+  );
+}
 function trimTrailingSlash(value) {
   return value.replace(/\/+$/, "");
 }
@@ -21520,11 +21880,13 @@ function resolveInputs(env = process.env) {
     postmanApiKey,
     postmanTeamId,
     githubToken: get("github-token", env.GITHUB_TOKEN || ""),
+    credentialPreflight: parsePreflightMode(get("credential-preflight", "warn")),
     pollTimeoutSeconds: clamp(rawTimeout, POLL_TIMEOUT_MIN, POLL_TIMEOUT_MAX, POLL_TIMEOUT_DEFAULT),
     pollIntervalSeconds: clamp(rawInterval, POLL_INTERVAL_MIN, POLL_INTERVAL_MAX, POLL_INTERVAL_DEFAULT),
     postmanStack,
     postmanApiBase: endpointProfile.apiBaseUrl,
     postmanBifrostBase: endpointProfile.bifrostBaseUrl,
+    postmanIapubBase: endpointProfile.iapubBaseUrl,
     postmanObservabilityBase: endpointProfile.observabilityBaseUrl,
     postmanObservabilityEnv: endpointProfile.observabilityEnv
   };
@@ -21620,11 +21982,14 @@ async function resolveApiKeyAndTeamId(inputs, client, reporter = core_exports) {
   let apiKey = inputs.postmanApiKey;
   const teamId = inputs.postmanTeamId;
   let keyValid = false;
+  let pmakIdentity;
   const apiBase = inputs.postmanApiBase || DEFAULT_POSTMAN_API_BASE;
   if (apiKey) {
     const result = await validateApiKey(apiKey, apiBase);
     keyValid = result.valid;
-    if (!keyValid) {
+    if (keyValid) {
+      pmakIdentity = { source: "pmak/me", teamId: result.teamId };
+    } else {
       reporter.warning("Provided postman-api-key is invalid or expired.");
     }
   }
@@ -21671,7 +22036,20 @@ async function resolveApiKeyAndTeamId(inputs, client, reporter = core_exports) {
   } else {
     reporter.info("No postman-team-id resolved; omitting x-entity-team-id so Bifrost resolves team from the access token.");
   }
-  return { apiKey, teamId: resolvedTeamId };
+  return { apiKey, teamId: resolvedTeamId, pmakIdentity };
+}
+async function runCredentialPreflightForInputs(inputs, pmak, reporter, fetchImpl) {
+  await runCredentialPreflight({
+    apiBaseUrl: inputs.postmanApiBase || DEFAULT_POSTMAN_API_BASE,
+    iapubBaseUrl: inputs.postmanIapubBase || DEFAULT_POSTMAN_IAPUB_BASE,
+    pmak,
+    postmanAccessToken: inputs.postmanAccessToken,
+    explicitTeamId: inputs.postmanTeamId || void 0,
+    mode: inputs.credentialPreflight,
+    mask: createSecretMasker([inputs.postmanApiKey, inputs.postmanAccessToken]),
+    log: reporter,
+    fetchImpl
+  });
 }
 
 // src/cli.ts
@@ -21722,6 +22100,7 @@ function parseCliArgs(argv, env = process.env) {
     "repo-url",
     "postman-access-token",
     "postman-api-key",
+    "credential-preflight",
     "postman-team-id",
     "github-token",
     "poll-timeout-seconds",
@@ -21790,10 +22169,15 @@ async function runCli(argv = process.argv.slice(2), runtime = {}) {
     observabilityBaseUrl: inputs.postmanObservabilityBase,
     observabilityEnv: inputs.postmanObservabilityEnv
   });
-  const { apiKey, teamId } = await resolveApiKeyAndTeamId(inputs, preliminaryClient, reporter);
+  const { apiKey, teamId, pmakIdentity } = await resolveApiKeyAndTeamId(
+    inputs,
+    preliminaryClient,
+    reporter
+  );
   if (apiKey) {
     reporter.setSecret(apiKey);
   }
+  await runCredentialPreflightForInputs(inputs, pmakIdentity, reporter);
   const client = new BifrostCatalogClient({
     accessToken: inputs.postmanAccessToken,
     teamId,

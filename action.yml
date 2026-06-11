@@ -31,6 +31,10 @@ inputs:
   postman-api-key:
     description: 'Postman API key (PMAK-*) for the application binding call. Auto-created from postman-access-token when omitted or invalid after a clear 401/403 validation failure.'
     required: false
+  credential-preflight:
+    description: 'Credential identity preflight policy. warn (default) logs a note and continues when postman-api-key and postman-access-token resolve to different parent orgs; enforce fails the run on that condition before any onboarding write; off skips the identity probes entirely (the reactive error guidance still applies). A rejected or auto-created postman-api-key is never failed on.'
+    required: false
+    default: 'warn'
   poll-timeout-seconds:
     description: 'Maximum seconds to wait for the service to appear in the discovered list'
     required: false

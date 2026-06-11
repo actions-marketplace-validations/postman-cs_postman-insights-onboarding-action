@@ -80,6 +80,35 @@ describe('alpha action contract', () => {
     expect(actionManifest.inputs['postman-api-key'].required).toBe(false);
   });
 
+  it('defaults credential-preflight to warn with enforce/warn/off allowed', () => {
+    const contractInput = customerPreviewActionContract.inputs['credential-preflight'];
+    expect(contractInput.required).toBe(false);
+    expect(contractInput.default).toBe('warn');
+    expect(contractInput.allowedValues).toEqual(['enforce', 'warn', 'off']);
+    expect(actionManifest.inputs['credential-preflight'].required).toBe(false);
+    expect(actionManifest.inputs['credential-preflight'].default).toBe('warn');
+  });
+
+  it('threads credential-preflight and the iapub base through resolveInputs with a warn default', () => {
+    const base = {
+      INPUT_PROJECT_NAME: 'svc',
+      INPUT_WORKSPACE_ID: 'ws-123',
+      INPUT_ENVIRONMENT_ID: 'env-456',
+      INPUT_POSTMAN_ACCESS_TOKEN: 'tok-abc',
+    };
+    expect(resolveInputs(base).credentialPreflight).toBe('warn');
+    expect(resolveInputs(base).postmanIapubBase).toBe('https://iapub.postman.co');
+    expect(
+      resolveInputs({ ...base, INPUT_CREDENTIAL_PREFLIGHT: 'enforce' }).credentialPreflight
+    ).toBe('enforce');
+    expect(
+      resolveInputs({ ...base, INPUT_CREDENTIAL_PREFLIGHT: 'off' }).credentialPreflight
+    ).toBe('off');
+    expect(() =>
+      resolveInputs({ ...base, INPUT_CREDENTIAL_PREFLIGHT: 'strict' })
+    ).toThrow(/Unsupported credential-preflight/);
+  });
+
   it('defaults poll-timeout-seconds to 120 and poll-interval-seconds to 10', () => {
     expect(customerPreviewActionContract.inputs['poll-timeout-seconds'].default).toBe('120');
     expect(customerPreviewActionContract.inputs['poll-interval-seconds'].default).toBe('10');

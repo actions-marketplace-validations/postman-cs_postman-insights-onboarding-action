@@ -1,11 +1,17 @@
 import * as core from '@actions/core';
 import { BifrostCatalogClient, findDiscoveredService } from './lib/bifrost-client.js';
 import {
+  runCredentialPreflight,
+  type CredentialIdentity,
+  type PreflightMode
+} from './lib/credential-identity.js';
+import {
   parsePostmanStack,
   resolvePostmanEndpointProfile,
   type PostmanStack
 } from './lib/postman/base-urls.js';
 import { sleep } from './lib/retry.js';
+import { createSecretMasker } from './lib/secrets.js';
 
 const POLL_TIMEOUT_MIN = 10;
 const POLL_TIMEOUT_MAX = 600;
@@ -17,7 +23,18 @@ const POLL_INTERVAL_DEFAULT = 10;
 const PROD_ENDPOINTS = resolvePostmanEndpointProfile('prod');
 export const DEFAULT_POSTMAN_API_BASE = PROD_ENDPOINTS.apiBaseUrl;
 export const DEFAULT_POSTMAN_BIFROST_BASE = PROD_ENDPOINTS.bifrostBaseUrl;
+export const DEFAULT_POSTMAN_IAPUB_BASE = PROD_ENDPOINTS.iapubBaseUrl;
 export const DEFAULT_POSTMAN_OBSERVABILITY_BASE = PROD_ENDPOINTS.observabilityBaseUrl;
+
+export function parsePreflightMode(value: string | undefined): PreflightMode {
+  const normalized = String(value || 'warn').trim().toLowerCase();
+  if (normalized === 'enforce' || normalized === 'warn' || normalized === 'off') {
+    return normalized;
+  }
+  throw new Error(
+    `Unsupported credential-preflight "${value}". Supported values: enforce, warn, off`
+  );
+}
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
@@ -76,11 +93,13 @@ export interface ActionInputs {
   postmanApiKey: string;
   postmanTeamId: string;
   githubToken: string;
+  credentialPreflight: PreflightMode;
   pollTimeoutSeconds: number;
   pollIntervalSeconds: number;
   postmanStack: PostmanStack;
   postmanApiBase: string;
   postmanBifrostBase: string;
+  postmanIapubBase: string;
   postmanObservabilityBase: string;
   postmanObservabilityEnv: string;
 }
@@ -162,11 +181,13 @@ export function resolveInputs(
     postmanApiKey,
     postmanTeamId,
     githubToken: get('github-token', env.GITHUB_TOKEN || ''),
+    credentialPreflight: parsePreflightMode(get('credential-preflight', 'warn')),
     pollTimeoutSeconds: clamp(rawTimeout, POLL_TIMEOUT_MIN, POLL_TIMEOUT_MAX, POLL_TIMEOUT_DEFAULT),
     pollIntervalSeconds: clamp(rawInterval, POLL_INTERVAL_MIN, POLL_INTERVAL_MAX, POLL_INTERVAL_DEFAULT),
     postmanStack,
     postmanApiBase: endpointProfile.apiBaseUrl,
     postmanBifrostBase: endpointProfile.bifrostBaseUrl,
+    postmanIapubBase: endpointProfile.iapubBaseUrl,
     postmanObservabilityBase: endpointProfile.observabilityBaseUrl,
     postmanObservabilityEnv: endpointProfile.observabilityEnv,
   };
@@ -295,17 +316,21 @@ export async function resolveApiKeyAndTeamId(
   inputs: ActionInputs,
   client: BifrostCatalogClient,
   reporter: Reporter = core
-): Promise<{ apiKey: string; teamId: string }> {
+): Promise<{ apiKey: string; teamId: string; pmakIdentity?: CredentialIdentity }> {
   let apiKey = inputs.postmanApiKey;
   const teamId = inputs.postmanTeamId;
   let keyValid = false;
+  let pmakIdentity: CredentialIdentity | undefined;
 
   const apiBase = inputs.postmanApiBase || DEFAULT_POSTMAN_API_BASE;
 
   if (apiKey) {
     const result = await validateApiKey(apiKey, apiBase);
     keyValid = result.valid;
-    if (!keyValid) {
+    if (keyValid) {
+      // Reused by the credential preflight so it never issues a second /me probe.
+      pmakIdentity = { source: 'pmak/me', teamId: result.teamId };
+    } else {
       reporter.warning('Provided postman-api-key is invalid or expired.');
     }
   }
@@ -360,7 +385,34 @@ export async function resolveApiKeyAndTeamId(
     reporter.info('No postman-team-id resolved; omitting x-entity-team-id so Bifrost resolves team from the access token.');
   }
 
-  return { apiKey, teamId: resolvedTeamId };
+  return { apiKey, teamId: resolvedTeamId, pmakIdentity };
+}
+
+/**
+ * Proactive credential preflight seam shared by the action and CLI entrypoints.
+ *
+ * The PMAK identity is reused from validateApiKey's /me result (via resolveApiKeyAndTeamId),
+ * so the preflight itself never issues a /me probe. A rejected or absent postman-api-key
+ * yields no PMAK identity, which downgrades the cross-check to a note; it can never FAIL
+ * the run, even under credential-preflight: enforce.
+ */
+export async function runCredentialPreflightForInputs(
+  inputs: ActionInputs,
+  pmak: CredentialIdentity | undefined,
+  reporter: Reporter,
+  fetchImpl?: typeof fetch
+): Promise<void> {
+  await runCredentialPreflight({
+    apiBaseUrl: inputs.postmanApiBase || DEFAULT_POSTMAN_API_BASE,
+    iapubBaseUrl: inputs.postmanIapubBase || DEFAULT_POSTMAN_IAPUB_BASE,
+    pmak,
+    postmanAccessToken: inputs.postmanAccessToken,
+    explicitTeamId: inputs.postmanTeamId || undefined,
+    mode: inputs.credentialPreflight,
+    mask: createSecretMasker([inputs.postmanApiKey, inputs.postmanAccessToken]),
+    log: reporter,
+    fetchImpl
+  });
 }
 
 export async function runAction(): Promise<void> {
@@ -383,7 +435,9 @@ export async function runAction(): Promise<void> {
     observabilityEnv: inputs.postmanObservabilityEnv,
   });
 
-  const { apiKey, teamId } = await resolveApiKeyAndTeamId(inputs, preliminaryClient, core);
+  const { apiKey, teamId, pmakIdentity } = await resolveApiKeyAndTeamId(inputs, preliminaryClient, core);
+
+  await runCredentialPreflightForInputs(inputs, pmakIdentity, core);
 
   const client = new BifrostCatalogClient({
     accessToken: inputs.postmanAccessToken,

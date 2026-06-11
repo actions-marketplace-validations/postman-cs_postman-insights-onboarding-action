@@ -1,5 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import {
+  parsePreflightMode,
+  runCredentialPreflightForInputs,
   runOnboarding,
   resolveApiKeyAndTeamId,
   resolveInputs,
@@ -7,6 +9,7 @@ import {
   type ActionInputs,
 } from '../src/index.js';
 import { BifrostCatalogClient, type DiscoveredService } from '../src/lib/bifrost-client.js';
+import { __resetIdentityMemo } from '../src/lib/credential-identity.js';
 
 function makeInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
   return {
@@ -20,11 +23,13 @@ function makeInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     postmanApiKey: 'PMAK-test',
     postmanTeamId: '14103640',
     githubToken: 'ghp_test',
+    credentialPreflight: 'warn',
     pollTimeoutSeconds: 5,
     pollIntervalSeconds: 1,
     postmanStack: 'prod',
     postmanApiBase: 'https://api.getpostman.com',
     postmanBifrostBase: 'https://bifrost-premium-https-v4.gw.postman.com',
+    postmanIapubBase: 'https://iapub.postman.co',
     postmanObservabilityBase: 'https://api.observability.postman.com',
     postmanObservabilityEnv: 'production',
     ...overrides,
@@ -510,5 +515,144 @@ describe('resolveApiKeyAndTeamId org-mode auto-detection', () => {
       client,
     );
     expect(result.teamId).toBe('');
+  });
+});
+
+describe('credential preflight seam', () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    __resetIdentityMemo();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function createReporter() {
+    const infos: string[] = [];
+    const warnings: string[] = [];
+    return {
+      infos,
+      warnings,
+      reporter: {
+        info: (message: string) => {
+          infos.push(message);
+        },
+        warning: (message: string) => {
+          warnings.push(message);
+        },
+        setSecret: () => {},
+      },
+    };
+  }
+
+  function sessionResponse(team: number) {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        identity: { team, domain: 'session-domain' },
+        data: { user: { id: 2, roles: ['admin'] } },
+        consumerType: 'service_account',
+      }),
+    };
+  }
+
+  it('resolveApiKeyAndTeamId surfaces the validated /me identity for preflight reuse', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ user: { teamId: 13347347 } }),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await resolveApiKeyAndTeamId(makeInputs({ postmanTeamId: '55555' }), makeClient());
+    expect(result.pmakIdentity).toEqual({ source: 'pmak/me', teamId: '13347347' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejected PMAK yields no pmak identity and the preflight never FAILs, even under enforce', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 401 }) as unknown as typeof fetch;
+    const resolved = await resolveApiKeyAndTeamId(makeInputs({ postmanTeamId: '55555' }), makeClient());
+    expect(resolved.apiKey).toBe('PMAK-generated');
+    expect(resolved.pmakIdentity).toBeUndefined();
+
+    const { infos, warnings, reporter } = createReporter();
+    const preflightFetch = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/me')) {
+        throw new Error('preflight must not probe /me');
+      }
+      return sessionResponse(13347347);
+    });
+
+    await expect(
+      runCredentialPreflightForInputs(
+        makeInputs({ credentialPreflight: 'enforce', postmanAccessToken: 'seam-token-rejected' }),
+        resolved.pmakIdentity,
+        reporter,
+        preflightFetch as unknown as typeof fetch
+      )
+    ).resolves.toBeUndefined();
+    expect(warnings.some((entry) => entry.includes('cross-check skipped'))).toBe(true);
+    expect(infos.some((entry) => entry.includes('access-token session identity'))).toBe(true);
+  });
+
+  it('reuses the pre-resolved pmak identity without a /me probe and FAILs under enforce on cross-org credentials', async () => {
+    const { reporter } = createReporter();
+    const preflightFetch = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/me')) {
+        throw new Error('preflight must not probe /me');
+      }
+      return sessionResponse(13347347);
+    });
+
+    await expect(
+      runCredentialPreflightForInputs(
+        makeInputs({ credentialPreflight: 'enforce', postmanAccessToken: 'seam-token-enforce' }),
+        { source: 'pmak/me', teamId: '10490519' },
+        reporter,
+        preflightFetch as unknown as typeof fetch
+      )
+    ).rejects.toThrow(/credential preflight FAILED/);
+    const meCalls = preflightFetch.mock.calls.filter((call) => String(call[0]).endsWith('/me'));
+    expect(meCalls).toHaveLength(0);
+  });
+
+  it('logs preflight OK when both identities resolve the same parent org', async () => {
+    const { infos, reporter } = createReporter();
+    const preflightFetch = vi.fn(async () => sessionResponse(13347347));
+
+    await runCredentialPreflightForInputs(
+      makeInputs({ credentialPreflight: 'enforce', postmanAccessToken: 'seam-token-ok' }),
+      { source: 'pmak/me', teamId: '13347347' },
+      reporter,
+      preflightFetch as unknown as typeof fetch
+    );
+    expect(infos.some((entry) => entry.includes('PMAK identity'))).toBe(true);
+    expect(infos.some((entry) => entry.includes('credential preflight OK'))).toBe(true);
+  });
+
+  it('mode off skips the identity probes entirely', async () => {
+    const { infos, warnings, reporter } = createReporter();
+    const preflightFetch = vi.fn();
+
+    await runCredentialPreflightForInputs(
+      makeInputs({ credentialPreflight: 'off', postmanAccessToken: 'seam-token-off' }),
+      { source: 'pmak/me', teamId: '13347347' },
+      reporter,
+      preflightFetch as unknown as typeof fetch
+    );
+    expect(preflightFetch).not.toHaveBeenCalled();
+    expect(infos).toHaveLength(0);
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('parsePreflightMode defaults to warn, normalizes case, and rejects unknown values', () => {
+    expect(parsePreflightMode(undefined)).toBe('warn');
+    expect(parsePreflightMode('')).toBe('warn');
+    expect(parsePreflightMode(' ENFORCE ')).toBe('enforce');
+    expect(parsePreflightMode('off')).toBe('off');
+    expect(() => parsePreflightMode('strict')).toThrow(/Unsupported credential-preflight/);
   });
 });

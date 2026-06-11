@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   resolveApiKeyAndTeamId,
   resolveInputs,
+  runCredentialPreflightForInputs,
   runOnboarding,
   type Reporter
 } from './index.js';
@@ -77,6 +78,7 @@ export function parseCliArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
     'repo-url',
     'postman-access-token',
     'postman-api-key',
+    'credential-preflight',
     'postman-team-id',
     'github-token',
     'poll-timeout-seconds',
@@ -160,10 +162,16 @@ export async function runCli(
     observabilityEnv: inputs.postmanObservabilityEnv
   });
 
-  const { apiKey, teamId } = await resolveApiKeyAndTeamId(inputs, preliminaryClient, reporter);
+  const { apiKey, teamId, pmakIdentity } = await resolveApiKeyAndTeamId(
+    inputs,
+    preliminaryClient,
+    reporter
+  );
   if (apiKey) {
     reporter.setSecret(apiKey);
   }
+
+  await runCredentialPreflightForInputs(inputs, pmakIdentity, reporter);
 
   const client = new BifrostCatalogClient({
     accessToken: inputs.postmanAccessToken,

@@ -129,7 +129,7 @@ describe('BifrostCatalogClient', () => {
     expect(callBody.body.via_integrations).toBe(false);
   });
 
-  it('throws HttpError on non-ok response after retries', async () => {
+  it('throws an advised 403 error on non-ok response after retries', async () => {
     const fetchFn = mockFetch([
       { ok: false, status: 403, body: { error: 'forbidden' } },
       { ok: false, status: 403, body: { error: 'forbidden' } },
@@ -146,8 +146,42 @@ describe('BifrostCatalogClient', () => {
       environmentId: 'env-x',
       gitRepositoryUrl: 'https://github.com/org/repo',
       gitApiKey: 'ghp_test',
-    })).rejects.toThrow(/failed.*403/);
+    })).rejects.toThrow(/refused git onboarding with 403/);
   }, 15_000);
+
+  it('enriches akita acknowledge failures with token-expiry advice', async () => {
+    const fetchFn = mockFetch([{
+      ok: false,
+      status: 401,
+      body: { error: { code: 'UNAUTHENTICATED' } },
+    }]);
+    const client = new BifrostCatalogClient({
+      accessToken: 'tok-abc',
+      teamId: '14103640',
+      apiKey: 'PMAK-test',
+      fetchFn,
+    });
+    await expect(client.acknowledgeOnboarding('svc_1', 'ws-1', 'sys-1')).rejects.toThrow(
+      /Insights acknowledge failed: 401[\s\S]*Re-mint a fresh token/
+    );
+  });
+
+  it('rewrites createApiKey UNAUTHENTICATED failures with token-expiry advice', async () => {
+    const fetchFn = mockFetch([{
+      ok: false,
+      status: 401,
+      body: { error: { code: 'UNAUTHENTICATED' } },
+    }]);
+    const client = new BifrostCatalogClient({
+      accessToken: 'tok-abc',
+      teamId: '14103640',
+      apiKey: '',
+      fetchFn,
+    });
+    await expect(client.createApiKey('expired-key')).rejects.toThrow(
+      /Bifrost rejected the access token \(UNAUTHENTICATED\)/
+    );
+  });
 
   it('creates application binding via observability API', async () => {
     const fetchFn = mockFetch([{
