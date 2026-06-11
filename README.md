@@ -38,7 +38,7 @@ jobs:
 
       # ... deploy your service to Kubernetes ...
 
-      - uses: postman-cs/postman-insights-onboarding-action@v0
+      - uses: postman-cs/postman-insights-onboarding-action@v1
         with:
           project-name: af-cards-activation
           workspace-id: ${{ steps.bootstrap.outputs.workspace-id }}
@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: postman-cs/postman-bootstrap-action@v0
+      - uses: postman-cs/postman-bootstrap-action@v1
         id: bootstrap
         with:
           project-name: af-cards-activation
@@ -69,7 +69,7 @@ jobs:
 
       # ... deploy service to Kubernetes ...
 
-      - uses: postman-cs/postman-repo-sync-action@v0
+      - uses: postman-cs/postman-repo-sync-action@v1
         id: sync
         with:
           project-name: af-cards-activation
@@ -82,7 +82,7 @@ jobs:
           postman-api-key: ${{ secrets.POSTMAN_API_KEY }}
           postman-access-token: ${{ secrets.POSTMAN_ACCESS_TOKEN }}
 
-      - uses: postman-cs/postman-insights-onboarding-action@v0
+      - uses: postman-cs/postman-insights-onboarding-action@v1
         with:
           project-name: af-cards-activation
           workspace-id: ${{ steps.bootstrap.outputs.workspace-id }}
@@ -266,6 +266,6 @@ npm run build
 
 ## Customer Preview Release Strategy
 
-- Customer Preview channel tags use `v0.x.y`.
-- Consumers can pin immutable tags such as `v0.1.0` for reproducibility.
-- Moving tag `v0` is used as the rolling customer preview channel.
+- Customer Preview channel tags use `v1.x.y`.
+- Consumers can pin immutable tags such as `v1.0.0` for reproducibility.
+- Moving tag `v1` is used as the rolling customer preview channel.
