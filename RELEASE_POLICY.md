@@ -2,32 +2,37 @@
 
 ## Source of truth
 
-Git tags are the public release source of truth for this action. `package.json` is used for npm packaging, but consumers should choose action versions by Git tag.
+Git tags and GitHub releases are the public release identifiers for this action. `package.json` versions support npm packaging, but consumers should select action versions by Git tag. The committed `dist/` bundle is part of the released artifact because GitHub Actions runs it verbatim from the tag.
 
-## Tags
+## Tag policy
 
-- Immutable release tags use `v1.x.y`.
-- The moving `v1` tag tracks the latest compatible `v1` release.
+- Immutable releases use `v1.x.y` tags.
+- The rolling `v1` alias moves to the latest compatible `v1.x.y` release.
 - Existing release tags are never force-pushed or rewritten.
-- Every immutable release tag should have a GitHub release with generated notes.
+- `v0` tags stay frozen at the last `v0` release.
+- Every immutable release tag has a GitHub release with generated notes.
 
-## Validation
+## Release checks
 
-Before pushing an immutable release tag:
+Run the package validators from this directory before pushing an immutable tag:
 
 1. Confirm the working tree is clean.
-2. Run `npm test`.
-3. Run `npm run typecheck`.
-4. Run `npm run lint`.
-5. Run `npm run build`.
-6. Run `npm run check:dist`.
-7. Confirm `README.md` generated tables match `action.yml`.
-8. Confirm `SECURITY.md`, `SUPPORT.md`, and this file still match the release surface.
+2. `npm test`
+3. `npm run typecheck`
+4. `npm run lint`
+5. `npm run build`
+6. `npm run check:dist`
+7. `npm run docs:tables` when `action.yml` changes, then confirm the `README.md` tables still match.
+8. Confirm `SECURITY.md`, `SUPPORT.md`, and this file still describe the release surface.
 
-## Publishing
+## npm package
 
-The release workflow validates the tag, publishes the GitHub release, and publishes the npm package when the tag matches the package version. The rolling `v1` tag updates the action channel and skips npm publishing.
+The CLI publishes as `@postman-cse/onboarding-insights` with versions that match the GitHub release tag. The rolling `v1` alias updates the action channel and skips npm publishing.
 
 ## Compatibility
 
-This action expects the workspace, environment, deployed service, and Insights agent to exist before it runs. Changes that make this action deploy the agent, create workspaces, or manage environments are outside the release contract for this repository.
+This action expects the workspace, environment, deployed service, and Insights agent to exist before it runs. Changes that make this action deploy the agent, create workspaces, or manage environments fall outside the release contract for this repository.
+
+## Security fixes
+
+Security fixes ship on the latest `v1.x.y` tag and move onto the rolling `v1` alias. Older immutable tags stay published for reproducibility. See [Security Policy](SECURITY.md).
