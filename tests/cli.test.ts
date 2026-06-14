@@ -5,6 +5,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleReporter, normalizeCliFlag, parseCliArgs, runCli, toDotenv } from '../src/cli.js';
 import { __resetIdentityMemo } from '../src/lib/credential-identity.js';
 
+// Spy on the telemetry completion seam so the preflight-throw path can be
+// asserted to still emit exactly one 'failure' event (regression: the credential
+// preflight used to throw before the telemetry try/catch, dropping the completion
+// event for the most operationally meaningful run -- a known-team credential
+// failure). index.ts runAction shares the identical try placement.
+const telemetrySpies = vi.hoisted(() => ({
+  emitCompletion: vi.fn(),
+  setTeamId: vi.fn()
+}));
+
+vi.mock('../src/lib/telemetry.js', () => ({
+  createTelemetryContext: vi.fn(() => ({
+    setTeamId: telemetrySpies.setTeamId,
+    emitCompletion: telemetrySpies.emitCompletion
+  }))
+}));
+
 describe('parseCliArgs', () => {
   it('maps CLI flags into INPUT_* env keys', () => {
     const config = parseCliArgs(
@@ -22,6 +39,7 @@ describe('parseCliArgs', () => {
         '--github-token', 'ghp-abc',
         '--poll-timeout-seconds', '180',
         '--poll-interval-seconds', '8',
+        '--postman-region', 'eu',
         '--postman-stack', 'beta',
         '--result-json', 'out/result.json',
         '--dotenv-path=out/result.env'
@@ -42,6 +60,7 @@ describe('parseCliArgs', () => {
     expect(config.inputEnv[normalizeCliFlag('github-token')]).toBe('ghp-abc');
     expect(config.inputEnv[normalizeCliFlag('poll-timeout-seconds')]).toBe('180');
     expect(config.inputEnv[normalizeCliFlag('poll-interval-seconds')]).toBe('8');
+    expect(config.inputEnv[normalizeCliFlag('postman-region')]).toBe('eu');
     expect(config.inputEnv[normalizeCliFlag('postman-stack')]).toBe('beta');
     expect(config.resultJsonPath).toBe('out/result.json');
     expect(config.dotenvPath).toBe('out/result.env');
@@ -63,6 +82,8 @@ describe('toDotenv', () => {
 describe('runCli credential preflight', () => {
   beforeEach(() => {
     __resetIdentityMemo();
+    telemetrySpies.emitCompletion.mockClear();
+    telemetrySpies.setTeamId.mockClear();
   });
 
   afterEach(() => {
@@ -123,6 +144,8 @@ describe('runCli credential preflight', () => {
       )
     ).rejects.toThrow(/credential preflight FAILED/);
     expect(executeOnboarding).not.toHaveBeenCalled();
+    expect(telemetrySpies.emitCompletion).toHaveBeenCalledTimes(1);
+    expect(telemetrySpies.emitCompletion).toHaveBeenCalledWith('failure');
   });
 
   it('continues under the default warn mode and surfaces the preflight note', async () => {

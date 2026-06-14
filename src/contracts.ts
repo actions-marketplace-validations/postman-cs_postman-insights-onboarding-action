@@ -9,14 +9,14 @@ export interface ActionOutputContract {
   description: string;
 }
 
-export interface CustomerPreviewActionContract {
+export interface ActionContract {
   name: string;
   description: string;
   inputs: Record<string, ActionInputContract>;
   outputs: Record<string, ActionOutputContract>;
 }
 
-export const customerPreviewActionContract: CustomerPreviewActionContract = {
+export const insightsActionContract: ActionContract = {
   name: 'Postman Onboarding: Insights Linking',
   description: 'Link Postman Insights discovered services to workspaces and git repos. Part of the Postman API Onboarding suite.',
   inputs: {
@@ -45,11 +45,11 @@ export const customerPreviewActionContract: CustomerPreviewActionContract = {
       required: false,
     },
     'postman-access-token': {
-      description: 'Postman access token for Bifrost API calls.',
+      description: 'Service-account Postman access token for integration API calls. Prefer minting it with postman-resolve-service-token-action.',
       required: true,
     },
     'postman-team-id': {
-      description: 'Explicit Postman team ID for org-mode Bifrost request headers. When omitted, x-entity-team-id is not sent.',
+      description: 'Explicit Postman team ID for org-mode integration request headers. When omitted, x-entity-team-id is not sent.',
       required: false,
     },
     'github-token': {
@@ -57,15 +57,15 @@ export const customerPreviewActionContract: CustomerPreviewActionContract = {
       required: false,
     },
     'postman-api-key': {
-      description: 'Postman API key (PMAK-*) for the application binding call. Auto-created from postman-access-token when omitted or invalid after a clear 401/403 validation failure.',
+      description: 'Service-account Postman API key (PMAK-*) for the application binding call. Auto-created from postman-access-token when omitted or invalid after a clear 401/403 validation failure.',
       required: false,
     },
     'credential-preflight': {
       description:
-        'Credential identity preflight policy. warn (default) logs a note and continues when postman-api-key and postman-access-token resolve to different parent orgs; enforce fails the run on that condition before any onboarding write; off skips the identity probes entirely (the reactive error guidance still applies). A rejected or auto-created postman-api-key is never failed on.',
+        'Credential identity preflight policy. warn (default) logs a note and continues when postman-api-key and postman-access-token resolve to different parent orgs; enforce fails the run on that condition before any onboarding write. Supported values are warn and enforce.',
       required: false,
       default: 'warn',
-      allowedValues: ['enforce', 'warn', 'off'],
+      allowedValues: ['enforce', 'warn'],
     },
     'poll-timeout-seconds': {
       description: 'Maximum seconds to wait for the service to appear in the discovered list.',
@@ -77,8 +77,14 @@ export const customerPreviewActionContract: CustomerPreviewActionContract = {
       required: false,
       default: '10',
     },
+    'postman-region': {
+      description: 'Postman data residency region for public API calls. One of: us or eu.',
+      required: false,
+      default: 'us',
+      allowedValues: ['us', 'eu'],
+    },
     'postman-stack': {
-      description: 'Postman stack profile.',
+      description: 'Postman stack profile. Defaults to the public production stack. Marketplace workflows should leave this as prod.',
       required: false,
       default: 'prod',
       allowedValues: ['prod', 'beta'],
@@ -106,5 +112,5 @@ export const customerPreviewActionContract: CustomerPreviewActionContract = {
   },
 };
 
-export const contractInputNames = Object.keys(customerPreviewActionContract.inputs);
-export const contractOutputNames = Object.keys(customerPreviewActionContract.outputs);
+export const contractInputNames = Object.keys(insightsActionContract.inputs);
+export const contractOutputNames = Object.keys(insightsActionContract.outputs);

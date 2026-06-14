@@ -13,9 +13,6 @@ import { parse } from 'yaml';
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const actionPath = resolve(repoRoot, 'action.yml');
 const readmePath = resolve(repoRoot, 'README.md');
-
-// postman-stack is an internal stack-profile escape hatch; the action contract
-// keeps it out of the README on purpose (see tests/contract.test.ts).
 const HIDDEN_INPUTS = new Set(['postman-stack']);
 
 const manifest = parse(readFileSync(actionPath, 'utf8'));

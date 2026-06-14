@@ -15,5 +15,7 @@ You should receive an acknowledgement within five business days. Please include 
 
 ## Scope Notes
 
-- This action handles Postman API keys and access tokens. Both are masked in logs by the action itself; never echo them in your own workflow steps.
+- This action handles Postman API keys, service-account access tokens, and team verification tokens. These values are masked in logs by the action itself; never echo them in your own workflow steps.
+- Prefer service-account tokens minted by `postman-resolve-service-token-action`. User/session tokens can expire and trigger credential-preflight warnings.
 - Reports about secrets you exposed in your own workflow configuration are out of scope; rotate the credential in Postman immediately.
+- Include only redacted workflow logs in reports.

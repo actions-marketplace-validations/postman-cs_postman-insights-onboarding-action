@@ -6,12 +6,15 @@ import {
   type PreflightMode
 } from './lib/credential-identity.js';
 import {
+  parsePostmanRegion,
   parsePostmanStack,
   resolvePostmanEndpointProfile,
+  type PostmanRegion,
   type PostmanStack
 } from './lib/postman/base-urls.js';
 import { sleep } from './lib/retry.js';
 import { createSecretMasker } from './lib/secrets.js';
+import { createTelemetryContext } from './lib/telemetry.js';
 
 const POLL_TIMEOUT_MIN = 10;
 const POLL_TIMEOUT_MAX = 600;
@@ -28,11 +31,11 @@ export const DEFAULT_POSTMAN_OBSERVABILITY_BASE = PROD_ENDPOINTS.observabilityBa
 
 export function parsePreflightMode(value: string | undefined): PreflightMode {
   const normalized = String(value || 'warn').trim().toLowerCase();
-  if (normalized === 'enforce' || normalized === 'warn' || normalized === 'off') {
+  if (normalized === 'enforce' || normalized === 'warn') {
     return normalized;
   }
   throw new Error(
-    `Unsupported credential-preflight "${value}". Supported values: enforce, warn, off`
+    `Unsupported credential-preflight "${value}". Supported values: enforce, warn`
   );
 }
 
@@ -96,6 +99,7 @@ export interface ActionInputs {
   credentialPreflight: PreflightMode;
   pollTimeoutSeconds: number;
   pollIntervalSeconds: number;
+  postmanRegion: PostmanRegion;
   postmanStack: PostmanStack;
   postmanApiBase: string;
   postmanBifrostBase: string;
@@ -167,8 +171,9 @@ export function resolveInputs(
 
   const rawTimeout = parseInt(get('poll-timeout-seconds', String(POLL_TIMEOUT_DEFAULT)), 10);
   const rawInterval = parseInt(get('poll-interval-seconds', String(POLL_INTERVAL_DEFAULT)), 10);
+  const postmanRegion = parsePostmanRegion(get('postman-region'));
   const postmanStack = parsePostmanStack(get('postman-stack'));
-  const endpointProfile = resolvePostmanEndpointProfile(postmanStack);
+  const endpointProfile = resolvePostmanEndpointProfile(postmanStack, postmanRegion);
 
   return {
     projectName,
@@ -184,6 +189,7 @@ export function resolveInputs(
     credentialPreflight: parsePreflightMode(get('credential-preflight', 'warn')),
     pollTimeoutSeconds: clamp(rawTimeout, POLL_TIMEOUT_MIN, POLL_TIMEOUT_MAX, POLL_TIMEOUT_DEFAULT),
     pollIntervalSeconds: clamp(rawInterval, POLL_INTERVAL_MIN, POLL_INTERVAL_MAX, POLL_INTERVAL_DEFAULT),
+    postmanRegion,
     postmanStack,
     postmanApiBase: endpointProfile.apiBaseUrl,
     postmanBifrostBase: endpointProfile.bifrostBaseUrl,
@@ -437,24 +443,30 @@ export async function runAction(): Promise<void> {
 
   const { apiKey, teamId, pmakIdentity } = await resolveApiKeyAndTeamId(inputs, preliminaryClient, core);
 
-  await runCredentialPreflightForInputs(inputs, pmakIdentity, core);
-
-  const client = new BifrostCatalogClient({
-    accessToken: inputs.postmanAccessToken,
-    teamId,
-    apiKey,
-    bifrostBaseUrl: inputs.postmanBifrostBase,
-    observabilityBaseUrl: inputs.postmanObservabilityBase,
-    observabilityEnv: inputs.postmanObservabilityEnv,
-  });
+  const telemetry = createTelemetryContext({ action: 'postman-insights-onboarding-action', logger: core });
+  telemetry.setTeamId(inputs.postmanTeamId || pmakIdentity?.teamId);
 
   let result: import('./index.js').OnboardingResult;
   try {
+    // Credential preflight can throw under enforce; keep it inside the try so a
+    // known-team credential failure still routes through emitCompletion('failure').
+    await runCredentialPreflightForInputs(inputs, pmakIdentity, core);
+
+    const client = new BifrostCatalogClient({
+      accessToken: inputs.postmanAccessToken,
+      teamId,
+      apiKey,
+      bifrostBaseUrl: inputs.postmanBifrostBase,
+      observabilityBaseUrl: inputs.postmanObservabilityBase,
+      observabilityEnv: inputs.postmanObservabilityEnv,
+    });
+
     result = await runOnboarding(inputs, client, sleep, core);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     core.setOutput('status', 'error');
     core.setFailed(`Insights onboarding failed: ${message}`);
+    telemetry.emitCompletion('failure');
     return;
   }
 
@@ -467,7 +479,9 @@ export async function runAction(): Promise<void> {
 
   if (result.status === 'not-found') {
     core.warning('Insights onboarding skipped: service not found in discovered list');
+    telemetry.emitCompletion('failure');
   } else {
     core.info(`Insights onboarding succeeded: ${result.discoveredServiceName} -> workspace ${inputs.workspaceId}`);
+    telemetry.emitCompletion('success');
   }
 }
