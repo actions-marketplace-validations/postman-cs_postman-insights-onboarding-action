@@ -157,11 +157,11 @@ See [CLI Usage](docs/cli.md) for provider auto-detection, output formats, and Gi
 <!-- inputs-table:start -->
 | Name | Description | Required | Default |
 | --- | --- | --- | --- |
-| `project-name` | Service name or spec ID to match against discovered service names | Yes |  |
+| `project-name` | Service name or Jira/Xray project key to match against the final discovered-service segment | Yes |  |
 | `workspace-id` | Postman workspace ID to link the discovered service to | Yes |  |
 | `environment-id` | Postman environment UID for the onboarding association | Yes |  |
 | `system-environment-id` | Postman system environment UUID for service-level Insights acknowledgment | No |  |
-| `cluster-name` | Insights cluster name. Matches {cluster}/{project-name} in discovered services | No |  |
+| `cluster-name` | Insights cluster name. When set, matches {cluster-name}/{project-name} exactly in discovered services | No |  |
 | `repo-url` | Repository URL for Git onboarding. Auto-detected from CI context when omitted. | No |  |
 | `postman-access-token` | Postman access token for Bifrost API calls | Yes |  |
 | `postman-team-id` | Explicit Postman team ID for org-mode Bifrost request headers. When omitted, x-entity-team-id is not sent. | No |  |

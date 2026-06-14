@@ -515,6 +515,66 @@ describe('BifrostCatalogClient', () => {
     await expect(client.resolveProviderServiceId('service-a', 'cluster-a')).resolves.toBe('svc-1');
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+
+  it('resolves provider service id from a bracketed Jira key in the final segment', async () => {
+    const fetchFn = mockFetch([{
+      ok: true,
+      status: 200,
+      body: {
+        services: [
+          { id: 'svc_xray_123', name: 'se-catalog-demo/[PROJ-123] my tests' },
+        ],
+      },
+    }]);
+    const client = new BifrostCatalogClient({
+      accessToken: 'tok-abc',
+      teamId: '14103640',
+      apiKey: 'PMAK-test',
+      fetchFn,
+    });
+
+    await expect(client.resolveProviderServiceId('PROJ-123')).resolves.toBe('svc_xray_123');
+  });
+
+  it('does not resolve provider service id from cluster token overlap', async () => {
+    const fetchFn = mockFetch([{
+      ok: true,
+      status: 200,
+      body: {
+        services: [
+          { id: 'svc_activation', name: 'se-catalog-demo/af-cards-activation' },
+        ],
+      },
+    }]);
+    const client = new BifrostCatalogClient({
+      accessToken: 'tok-abc',
+      teamId: '14103640',
+      apiKey: 'PMAK-test',
+      fetchFn,
+    });
+
+    await expect(client.resolveProviderServiceId('catalog')).resolves.toBeNull();
+  });
+
+  it('does not resolve provider service id from a partial final segment', async () => {
+    const fetchFn = mockFetch([{
+      ok: true,
+      status: 200,
+      body: {
+        services: [
+          { id: 'svc_activation', name: 'se-catalog-demo/af-cards-activation' },
+        ],
+      },
+    }]);
+    const client = new BifrostCatalogClient({
+      accessToken: 'tok-abc',
+      teamId: '14103640',
+      apiKey: 'PMAK-test',
+      fetchFn,
+    });
+
+    await expect(client.resolveProviderServiceId('af-cards')).resolves.toBeNull();
+  });
 });
 
 describe('findDiscoveredService', () => {
@@ -535,6 +595,29 @@ describe('findDiscoveredService', () => {
 
   it('returns undefined when no match', () => {
     const match = findDiscoveredService(sampleServices, 'nonexistent', 'se-catalog-demo');
+    expect(match).toBeUndefined();
+  });
+
+  it('matches a bracketed Jira key in the final segment', () => {
+    const xrayServices: DiscoveredService[] = [
+      {
+        ...sampleServices[0],
+        id: 24777,
+        name: 'se-catalog-demo/[PROJ-123] my tests',
+      },
+    ];
+
+    const match = findDiscoveredService(xrayServices, 'PROJ-123');
+    expect(match?.id).toBe(24777);
+  });
+
+  it('does not match a cluster token overlap when cluster is omitted', () => {
+    const match = findDiscoveredService(sampleServices, 'catalog');
+    expect(match).toBeUndefined();
+  });
+
+  it('does not match a partial final segment when cluster is omitted', () => {
+    const match = findDiscoveredService(sampleServices, 'af-cards');
     expect(match).toBeUndefined();
   });
 });
