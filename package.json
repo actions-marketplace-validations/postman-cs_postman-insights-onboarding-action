@@ -1,6 +1,6 @@
 {
   "name": "@postman-cse/onboarding-insights",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "GitHub Action to onboard Postman Insights discovered services to API Catalog workspaces.",
   "type": "module",
   "main": "dist/index.cjs",
@@ -35,7 +35,7 @@
   },
   "dependencies": {
     "@actions/core": "^3.0.1",
-    "@postman-cse/automation-telemetry-core": "^0.1.0",
+    "@postman-cse/automation-telemetry-core": "^0.2.0",
     "undici": "^6.24.0"
   },
   "overrides": {
