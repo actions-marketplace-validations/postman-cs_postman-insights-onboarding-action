@@ -47,7 +47,7 @@ jobs:
 
       - uses: postman-cs/postman-insights-onboarding-action@v1
         with:
-          project-name: af-cards-activation
+          project-name: core-payments
           workspace-id: ${{ vars.POSTMAN_WORKSPACE_ID }}
           environment-id: ${{ vars.POSTMAN_ENVIRONMENT_ID }}
           postman-region: us
@@ -77,7 +77,7 @@ jobs:
 
       - uses: postman-cs/postman-insights-onboarding-action@v1
         with:
-          project-name: af-cards-activation
+          project-name: core-payments
           workspace-id: ${{ vars.POSTMAN_WORKSPACE_ID }}
           environment-id: ${{ vars.POSTMAN_ENVIRONMENT_ID }}
           cluster-name: my-cluster
@@ -107,7 +107,7 @@ jobs:
       - uses: postman-cs/postman-bootstrap-action@v1
         id: bootstrap
         with:
-          project-name: af-cards-activation
+          project-name: core-payments
           spec-url: https://raw.githubusercontent.com/postman-cs/postman-insights-onboarding-action/main/examples/core-payments-openapi.yaml
           postman-region: us
           postman-api-key: ${{ secrets.POSTMAN_API_KEY }}
@@ -118,7 +118,7 @@ jobs:
       - uses: postman-cs/postman-repo-sync-action@v1
         id: sync
         with:
-          project-name: af-cards-activation
+          project-name: core-payments
           workspace-id: ${{ steps.bootstrap.outputs.workspace-id }}
           baseline-collection-id: ${{ steps.bootstrap.outputs.baseline-collection-id }}
           smoke-collection-id: ${{ steps.bootstrap.outputs.smoke-collection-id }}
@@ -131,7 +131,7 @@ jobs:
 
       - uses: postman-cs/postman-insights-onboarding-action@v1
         with:
-          project-name: af-cards-activation
+          project-name: core-payments
           workspace-id: ${{ steps.bootstrap.outputs.workspace-id }}
           environment-id: ${{ fromJSON(steps.sync.outputs.environment-uids-json).prod }}
           cluster-name: my-cluster
@@ -149,7 +149,7 @@ The Insights agent takes time to discover services after pods start. The action 
 ```yaml
       - uses: postman-cs/postman-insights-onboarding-action@v1
         with:
-          project-name: af-cards-activation
+          project-name: core-payments
           workspace-id: ${{ vars.POSTMAN_WORKSPACE_ID }}
           environment-id: ${{ vars.POSTMAN_ENVIRONMENT_ID }}
           postman-region: us
@@ -167,7 +167,7 @@ Before any onboarding write, the action can verify that `postman-api-key` and `p
 ```yaml
       - uses: postman-cs/postman-insights-onboarding-action@v1
         with:
-          project-name: af-cards-activation
+          project-name: core-payments
           workspace-id: ${{ vars.POSTMAN_WORKSPACE_ID }}
           environment-id: ${{ vars.POSTMAN_ENVIRONMENT_ID }}
           postman-access-token: ${{ steps.postman_token.outputs.token }}
@@ -184,7 +184,7 @@ The same logic ships as a CLI (`postman-insights-onboard`) for GitLab CI, Bitbuc
 ```bash
 npm install -g @postman-cse/onboarding-insights
 postman-insights-onboard \
-  --project-name af-cards-activation \
+  --project-name core-payments \
   --workspace-id ws_123 \
   --environment-id env_123 \
   --postman-access-token "$POSTMAN_ACCESS_TOKEN" \
@@ -283,7 +283,7 @@ This action sends a single anonymous usage event when a run completes, so the
 Postman team can measure adoption across CI systems. The event contains the
 action name and version, your Postman team ID, the detected CI provider and
 runner kind, the run outcome, the CI run identifier, an event timestamp, and a one-way SHA-256 hash of the repository
-identifier. The Postman team ID is sent in the clear on a legitimate-interest
+identifier. Each event also carries a schema version and a constant event type used only by the collector. The Postman team ID is sent in the clear on a legitimate-interest
 basis to measure product adoption.
 
 The `events.pm-cse.dev` endpoint is operated by the Postman Customer Success
