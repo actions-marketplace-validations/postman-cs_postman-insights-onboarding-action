@@ -23,13 +23,15 @@ This repo includes `.github/workflows/contract-smoke.yml`, a scheduled live cont
 
 Configure these repository secrets before enabling the workflow:
 
-- `SMOKE_ORG_API_KEY`
-- `SMOKE_ORG_ACCESS_TOKEN`
+- `SMOKE_ORG_API_KEY`: a service-account PMAK used by the smoke workflow to call `/me`, `/teams`, and mint a short-lived access token at runtime.
 
-The smoke workflow verifies `/me`, `/teams`, `iapub.postman.co/api/sessions/current`, and Bifrost API key creation so auth or payload drift shows up in CI before it hits production onboarding runs.
+Scheduled and manual smoke runs first execute a secret preflight. If `SMOKE_ORG_API_KEY` is missing, the workflow writes a notice and job summary, sets `run_smoke=false`, and skips the live API contract job without failing the repository.
 
-## Release strategy (Customer Preview)
+The smoke workflow verifies `/me`, `/teams`, mints a service-account access token, checks `iapub.postman.co/api/sessions/current`, and verifies API key creation so auth or payload drift shows up in CI before it hits onboarding runs.
 
-- Customer Preview channel tags use `v1.x.y`.
+## Release strategy
+
+- Immutable release tags use `v1.x.y`.
 - Consumers can pin immutable tags such as `v1.0.0` for reproducibility.
-- Moving tag `v1` is used as the rolling customer preview channel.
+- Moving tag `v1` tracks the latest release for convenience.
+- See [Release Policy](../RELEASE_POLICY.md) for tag, npm, and validation rules.

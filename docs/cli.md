@@ -8,6 +8,15 @@ Install globally:
 npm install -g @postman-cse/onboarding-insights
 ```
 
+Mint a service-account access token first:
+
+```bash
+POSTMAN_REGION="${POSTMAN_REGION:-us}"
+TOKEN_JSON=$(npx @postman-cse/onboarding-resolve-service-token --postman-api-key "$POSTMAN_API_KEY" --postman-region "$POSTMAN_REGION")
+export POSTMAN_ACCESS_TOKEN=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON).token)')
+export POSTMAN_TEAM_ID=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON)["team-id"])')
+```
+
 Basic usage:
 
 ```bash
@@ -16,7 +25,9 @@ postman-insights-onboard \
   --workspace-id ws_123 \
   --environment-id env_123 \
   --postman-access-token "$POSTMAN_ACCESS_TOKEN" \
+  --postman-team-id "$POSTMAN_TEAM_ID" \
   --postman-api-key "$POSTMAN_API_KEY" \
+  --postman-region "$POSTMAN_REGION" \
   --cluster-name my-cluster \
   --repo-url https://gitlab.com/acme/af-cards-activation \
   --poll-timeout-seconds 180 \
@@ -35,7 +46,11 @@ onboarding:
   image: node:24
   script:
     - npm install -g @postman-cse/onboarding-insights
-    - postman-insights-onboard --project-name af-cards-activation --workspace-id "$WORKSPACE_ID" --environment-id "$ENVIRONMENT_ID" --postman-access-token "$POSTMAN_ACCESS_TOKEN" --postman-api-key "$POSTMAN_API_KEY" --cluster-name "$CLUSTER_NAME" --repo-url "$CI_PROJECT_URL" --poll-timeout-seconds 180 --result-json insights-result.json --dotenv-path insights.env
+    - export POSTMAN_REGION="${POSTMAN_REGION:-us}"
+    - TOKEN_JSON=$(npx @postman-cse/onboarding-resolve-service-token --postman-api-key "$POSTMAN_API_KEY" --postman-region "$POSTMAN_REGION")
+    - export POSTMAN_ACCESS_TOKEN=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON).token)')
+    - export POSTMAN_TEAM_ID=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON)["team-id"])')
+    - postman-insights-onboard --project-name af-cards-activation --workspace-id "$WORKSPACE_ID" --environment-id "$ENVIRONMENT_ID" --postman-access-token "$POSTMAN_ACCESS_TOKEN" --postman-team-id "$POSTMAN_TEAM_ID" --postman-api-key "$POSTMAN_API_KEY" --postman-region "$POSTMAN_REGION" --cluster-name "$CLUSTER_NAME" --repo-url "$CI_PROJECT_URL" --poll-timeout-seconds 180 --result-json insights-result.json --dotenv-path insights.env
 ```
 
 ## Bitbucket Pipelines
@@ -48,7 +63,11 @@ pipelines:
     - step:
         script:
           - npm install -g @postman-cse/onboarding-insights
-          - postman-insights-onboard --project-name af-cards-activation --workspace-id "$WORKSPACE_ID" --environment-id "$ENVIRONMENT_ID" --postman-access-token "$POSTMAN_ACCESS_TOKEN" --postman-api-key "$POSTMAN_API_KEY" --cluster-name "$CLUSTER_NAME" --repo-url "$BITBUCKET_GIT_HTTP_ORIGIN" --poll-timeout-seconds 180 --result-json insights-result.json --dotenv-path insights.env
+          - export POSTMAN_REGION="${POSTMAN_REGION:-us}"
+          - TOKEN_JSON=$(npx @postman-cse/onboarding-resolve-service-token --postman-api-key "$POSTMAN_API_KEY" --postman-region "$POSTMAN_REGION")
+          - export POSTMAN_ACCESS_TOKEN=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON).token)')
+          - export POSTMAN_TEAM_ID=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON)["team-id"])')
+          - postman-insights-onboard --project-name af-cards-activation --workspace-id "$WORKSPACE_ID" --environment-id "$ENVIRONMENT_ID" --postman-access-token "$POSTMAN_ACCESS_TOKEN" --postman-team-id "$POSTMAN_TEAM_ID" --postman-api-key "$POSTMAN_API_KEY" --postman-region "$POSTMAN_REGION" --cluster-name "$CLUSTER_NAME" --repo-url "$BITBUCKET_GIT_HTTP_ORIGIN" --poll-timeout-seconds 180 --result-json insights-result.json --dotenv-path insights.env
 ```
 
 ## Azure DevOps
@@ -63,6 +82,10 @@ steps:
       versionSpec: '24.x'
   - script: |
       npm install -g @postman-cse/onboarding-insights
-      postman-insights-onboard --project-name af-cards-activation --workspace-id "$(WORKSPACE_ID)" --environment-id "$(ENVIRONMENT_ID)" --postman-access-token "$(POSTMAN_ACCESS_TOKEN)" --postman-api-key "$(POSTMAN_API_KEY)" --cluster-name "$(CLUSTER_NAME)" --repo-url "$(BUILD_REPOSITORY_URI)" --poll-timeout-seconds 180 --result-json insights-result.json --dotenv-path insights.env
+      POSTMAN_REGION="${POSTMAN_REGION:-us}"
+      TOKEN_JSON=$(npx @postman-cse/onboarding-resolve-service-token --postman-api-key "$(POSTMAN_API_KEY)" --postman-region "$POSTMAN_REGION")
+      POSTMAN_ACCESS_TOKEN=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON).token)')
+      POSTMAN_TEAM_ID=$(TOKEN_JSON="$TOKEN_JSON" node -e 'process.stdout.write(JSON.parse(process.env.TOKEN_JSON)["team-id"])')
+      postman-insights-onboard --project-name af-cards-activation --workspace-id "$(WORKSPACE_ID)" --environment-id "$(ENVIRONMENT_ID)" --postman-access-token "$POSTMAN_ACCESS_TOKEN" --postman-team-id "$POSTMAN_TEAM_ID" --postman-api-key "$(POSTMAN_API_KEY)" --postman-region "$POSTMAN_REGION" --cluster-name "$(CLUSTER_NAME)" --repo-url "$(BUILD_REPOSITORY_URI)" --poll-timeout-seconds 180 --result-json insights-result.json --dotenv-path insights.env
     displayName: Run Postman Insights onboarding
 ```

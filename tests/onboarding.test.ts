@@ -26,6 +26,7 @@ function makeInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     credentialPreflight: 'warn',
     pollTimeoutSeconds: 5,
     pollIntervalSeconds: 1,
+    postmanRegion: 'us',
     postmanStack: 'prod',
     postmanApiBase: 'https://api.getpostman.com',
     postmanBifrostBase: 'https://bifrost-premium-https-v4.gw.postman.com',
@@ -633,26 +634,11 @@ describe('credential preflight seam', () => {
     expect(infos.some((entry) => entry.includes('credential preflight OK'))).toBe(true);
   });
 
-  it('mode off skips the identity probes entirely', async () => {
-    const { infos, warnings, reporter } = createReporter();
-    const preflightFetch = vi.fn();
-
-    await runCredentialPreflightForInputs(
-      makeInputs({ credentialPreflight: 'off', postmanAccessToken: 'seam-token-off' }),
-      { source: 'pmak/me', teamId: '13347347' },
-      reporter,
-      preflightFetch as unknown as typeof fetch
-    );
-    expect(preflightFetch).not.toHaveBeenCalled();
-    expect(infos).toHaveLength(0);
-    expect(warnings).toHaveLength(0);
-  });
-
   it('parsePreflightMode defaults to warn, normalizes case, and rejects unknown values', () => {
     expect(parsePreflightMode(undefined)).toBe('warn');
     expect(parsePreflightMode('')).toBe('warn');
     expect(parsePreflightMode(' ENFORCE ')).toBe('enforce');
-    expect(parsePreflightMode('off')).toBe('off');
+    expect(() => parsePreflightMode('off')).toThrow(/Unsupported credential-preflight/);
     expect(() => parsePreflightMode('strict')).toThrow(/Unsupported credential-preflight/);
   });
 });

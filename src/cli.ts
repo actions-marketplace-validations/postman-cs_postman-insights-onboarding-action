@@ -11,6 +11,8 @@ import {
 } from './index.js';
 import { BifrostCatalogClient } from './lib/bifrost-client.js';
 import { sleep } from './lib/retry.js';
+import { getMemoizedSessionIdentity } from './lib/credential-identity.js';
+import { createTelemetryContext } from '@postman-cse/automation-telemetry-core';
 
 interface CliConfig {
   inputEnv: NodeJS.ProcessEnv;
@@ -83,6 +85,7 @@ export function parseCliArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
     'github-token',
     'poll-timeout-seconds',
     'poll-interval-seconds',
+    'postman-region',
     'postman-stack'
   ];
 
@@ -167,26 +170,42 @@ export async function runCli(
     preliminaryClient,
     reporter
   );
+
+  const telemetry = createTelemetryContext({ action: 'postman-insights-onboarding-action', logger: reporter });
+  telemetry.setTeamId(inputs.postmanTeamId || pmakIdentity?.teamId);
   if (apiKey) {
     reporter.setSecret(apiKey);
   }
 
-  await runCredentialPreflightForInputs(inputs, pmakIdentity, reporter);
+  let result: Awaited<ReturnType<typeof runOnboarding>>;
+  try {
+    // Credential preflight can throw under enforce; keep it inside the try so a
+    // known-team credential failure still routes through emitCompletion('failure').
+    await runCredentialPreflightForInputs(inputs, pmakIdentity, reporter);
 
-  const client = new BifrostCatalogClient({
-    accessToken: inputs.postmanAccessToken,
-    teamId,
-    apiKey,
-    bifrostBaseUrl: inputs.postmanBifrostBase,
-    observabilityBaseUrl: inputs.postmanObservabilityBase,
-    observabilityEnv: inputs.postmanObservabilityEnv
-  });
+    const client = new BifrostCatalogClient({
+      accessToken: inputs.postmanAccessToken,
+      teamId,
+      apiKey,
+      bifrostBaseUrl: inputs.postmanBifrostBase,
+      observabilityBaseUrl: inputs.postmanObservabilityBase,
+      observabilityEnv: inputs.postmanObservabilityEnv
+    });
 
-  const result = await (runtime.executeOnboarding ?? runOnboarding)(
-    inputs,
-    client,
-    sleep,
-    reporter
+    result = await (runtime.executeOnboarding ?? runOnboarding)(
+      inputs,
+      client,
+      sleep,
+      reporter
+    );
+  } catch (error) {
+    telemetry.setAccountType(getMemoizedSessionIdentity()?.consumerType);
+    telemetry.emitCompletion('failure');
+    throw error;
+  }
+  telemetry.setAccountType(getMemoizedSessionIdentity()?.consumerType);
+  telemetry.emitCompletion(
+    result.status === 'error' || result.status === 'not-found' ? 'failure' : 'success'
   );
   const outputs = toOutputs(result);
 

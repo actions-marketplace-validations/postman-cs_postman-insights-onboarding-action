@@ -8,11 +8,65 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Smoke credential preflight
+    runs-on: ubuntu-latest
+    outputs:
+      run_smoke: ${{ steps.credentials.outputs.run_smoke }}
+    steps:
+      - id: credentials
+        name: Check required smoke secrets
+        env:
+          SMOKE_ORG_API_KEY: ${{ secrets.SMOKE_ORG_API_KEY }}
+        run: |
+          set -euo pipefail
+          run_smoke=true
+          missing=()
+          allow_skip=false
+          missing_required=false
+
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            allow_skip=true
+          fi
+
+          if [ -z "${SMOKE_ORG_API_KEY:-}" ]; then
+            if [ "$allow_skip" = "true" ]; then
+              echo "::notice::Skipping Insights contract smoke: SMOKE_ORG_API_KEY is not configured."
+            else
+              echo "::error::Cannot run Insights contract smoke: SMOKE_ORG_API_KEY is not configured."
+              missing_required=true
+            fi
+            run_smoke=false
+            missing+=("SMOKE_ORG_API_KEY")
+          fi
+
+          {
+            echo "### Insights contract smoke"
+            if [ "$run_smoke" = "true" ]; then
+              echo "All required smoke secrets are configured. Live contract checks will run."
+            else
+              echo "Skipping live contract checks because required smoke secrets are missing."
+              printf -- '- %s\n' "${missing[@]}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$missing_required" = "true" ]; then
+            exit 1
+          fi
+
+          echo "run_smoke=$run_smoke" >> "$GITHUB_OUTPUT"
+
   api-contract-smoke:
     name: Insights API Contract
     runs-on: ubuntu-latest
+    needs: preflight
+    if: ${{ needs.preflight.outputs.run_smoke == 'true' }}
     steps:
       - uses: actions/checkout@v6
+      - id: postman-token
+        uses: postman-cs/postman-resolve-service-token-action@v1
+        with:
+          postman-api-key: ${{ secrets.SMOKE_ORG_API_KEY }}
       - name: Verify GET /me
         env:
           PMAK: ${{ secrets.SMOKE_ORG_API_KEY }}
@@ -38,7 +92,7 @@ jobs:
 
       - name: Verify session endpoint
         env:
-          ACCESS_TOKEN: ${{ secrets.SMOKE_ORG_ACCESS_TOKEN }}
+          ACCESS_TOKEN: ${{ steps.postman-token.outputs.token }}
         run: |
           set -euo pipefail
           response=$(curl -sf \
@@ -53,7 +107,7 @@ jobs:
 
       - name: Verify Bifrost API key creation
         env:
-          ACCESS_TOKEN: ${{ secrets.SMOKE_ORG_ACCESS_TOKEN }}
+          ACCESS_TOKEN: ${{ steps.postman-token.outputs.token }}
         run: |
           set -euo pipefail
           ts=$(date +%s)
