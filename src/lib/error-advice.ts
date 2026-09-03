@@ -1,5 +1,9 @@
-import type { HttpError } from './http-error.js';
-import type { SecretMasker } from './secrets.js';
+import type { HttpError } from '@postman-cs/automation-core';
+import { toOneLine, type SecretMasker } from './secrets.js';
+
+function safeAdvice(mask: SecretMasker, message: string): string {
+  return toOneLine(mask(message));
+}
 
 export interface ErrorAdviceContext {
   operation: string;
@@ -21,9 +25,8 @@ export const WORKSPACE_PERSONAL_ONLY_ADVICE =
 function expiryAdvice(code: 'UNAUTHENTICATED' | 'authenticationError'): string {
   return (
     `postman: Bifrost rejected the access token (${code}). ` +
-    'Service-account access tokens expire after about 1 to 1.5 hours; this run likely outlived its token. ' +
-    'Re-mint a fresh token (postman-resolve-service-token-action, or POST https://api.getpostman.com/service-account-tokens) and re-run. ' +
-    'If it was just minted, confirm postman-access-token is the token for the same parent org as postman-api-key.'
+    'Provide a fresh human-user session access token; it cannot be minted from a PMAK. ' +
+    'Confirm postman-access-token belongs to the same parent org as postman-api-key and re-run.'
   );
 }
 
@@ -89,7 +92,7 @@ export function adviseFromHttpError(err: HttpError, ctx: ErrorAdviceContext): Er
   if (!advice) {
     return undefined;
   }
-  return new Error(ctx.mask(advice), { cause: err });
+  return new Error(safeAdvice(ctx.mask, advice), { cause: err });
 }
 
 export function adviseFromBifrostBody(
@@ -101,7 +104,8 @@ export function adviseFromBifrostBody(
   if (!advice) {
     return undefined;
   }
-  return new Error(ctx.mask(advice), {
-    cause: new Error(ctx.mask(`HTTP ${status}: ${String(body || '').slice(0, 800)}`))
+  const safeBody = safeAdvice(ctx.mask, String(body || '')).slice(0, 800);
+  return new Error(safeAdvice(ctx.mask, advice), {
+    cause: new Error(`HTTP ${status}: ${safeBody}`)
   });
 }

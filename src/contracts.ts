@@ -45,8 +45,8 @@ export const insightsActionContract: ActionContract = {
       required: false,
     },
     'postman-access-token': {
-      description: 'Service-account Postman access token for integration API calls. Prefer minting it with postman-resolve-service-token-action.',
-      required: true,
+      description: 'Required human-user session access token for Bifrost and Akita calls. It cannot be minted or refreshed from a PMAK.',
+      required: false,
     },
     'postman-team-id': {
       description: 'Explicit Postman team ID for org-mode integration request headers. When omitted, x-entity-team-id is not sent.',
@@ -57,15 +57,30 @@ export const insightsActionContract: ActionContract = {
       required: false,
     },
     'postman-api-key': {
-      description: 'Service-account Postman API key (PMAK-*) for the application binding call. Auto-created from postman-access-token when omitted or invalid after a clear 401/403 validation failure.',
+      description:
+        'Human-user Postman API key (PMAK-*) for observability application binding. Service-account PMAKs are rejected.',
       required: false,
+    },
+    'create-api-key': {
+      description:
+        'Explicit opt-in to create a durable Bifrost API key when postman-api-key is omitted or invalid. Default false. Supported values: true, false.',
+      required: false,
+      default: 'false',
+      allowedValues: ['true', 'false'],
     },
     'credential-preflight': {
       description:
-        'Credential identity preflight policy. warn (default) logs a note and continues when postman-api-key and postman-access-token resolve to different parent orgs; enforce fails the run on that condition before any onboarding write. Supported values are warn and enforce.',
+        'Credential identity preflight policy. enforce (default) fails before linking writes when postman-api-key and postman-access-token resolve to different parent orgs; warn is an explicit compatibility policy that logs and continues. Supported values are enforce and warn.',
       required: false,
-      default: 'warn',
+      default: 'enforce',
       allowedValues: ['enforce', 'warn'],
+    },
+    'service-not-found-policy': {
+      description:
+        'Behavior when the discovered service is absent after polling. fail (default) aborts full linking; warn returns status=not-found without writes. Supported values: fail, warn.',
+      required: false,
+      default: 'fail',
+      allowedValues: ['fail', 'warn'],
     },
     'poll-timeout-seconds': {
       description: 'Maximum seconds to wait for the service to appear in the discovered list.',
@@ -89,6 +104,20 @@ export const insightsActionContract: ActionContract = {
       default: 'prod',
       allowedValues: ['prod', 'beta'],
     },
+    'branch-strategy': {
+      description: 'Branch-aware sync strategy. legacy keeps branch-blind behavior; publish-gate skips non-canonical writes; preview supports branch-scoped asset sets.',
+      required: false,
+      default: 'legacy',
+      allowedValues: ['legacy', 'publish-gate', 'preview'],
+    },
+    'canonical-branch': {
+      description: 'Explicit canonical branch. Defaults to the provider-resolved default branch.',
+      required: false,
+    },
+    channels: {
+      description: 'Comma-separated channel map for long-lived promotion branches.',
+      required: false,
+    },
   },
   outputs: {
     'discovered-service-id': {
@@ -107,7 +136,13 @@ export const insightsActionContract: ActionContract = {
       description: 'Insights team verification token (tvt_*) for DaemonSet telemetry.',
     },
     'status': {
-      description: 'Onboarding result: success, not-found, or error.',
+      description: 'Onboarding result: success, not-found, or error. skipped when the branch-aware gate skips the run; pending only until the run completes.',
+    },
+    'sync-status': {
+      description: 'Branch-aware sync status.',
+    },
+    'branch-decision': {
+      description: 'Serialized BranchDecision JSON.',
     },
   },
 };

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { HttpError } from '../src/lib/http-error.js';
+import { HttpError } from '@postman-cs/automation-core';
 import { createSecretMasker, REDACTED } from '../src/lib/secrets.js';
 import {
   WORKSPACE_PERSONAL_ONLY_ADVICE,
@@ -29,16 +29,15 @@ function bifrostHttpError(status: number, responseBody: string): HttpError {
 }
 
 describe('error advice', () => {
-  it('UNAUTHENTICATED bare body -> "access token rejected ... re-mint via postman-resolve-service-token-action or POST /service-account-tokens"', () => {
+  it('UNAUTHENTICATED bare body requires a fresh human-user session token', () => {
     const httpErr = bifrostHttpError(401, '{"error":{"code":"UNAUTHENTICATED"}}');
     const advised = adviseFromHttpError(httpErr, createContext());
 
     expect(advised).toBeDefined();
     expect(advised?.message).toBe(
       'postman: Bifrost rejected the access token (UNAUTHENTICATED). ' +
-        'Service-account access tokens expire after about 1 to 1.5 hours; this run likely outlived its token. ' +
-        'Re-mint a fresh token (postman-resolve-service-token-action, or POST https://api.getpostman.com/service-account-tokens) and re-run. ' +
-        'If it was just minted, confirm postman-access-token is the token for the same parent org as postman-api-key.'
+        'Provide a fresh human-user session access token; it cannot be minted from a PMAK. ' +
+        'Confirm postman-access-token belongs to the same parent org as postman-api-key and re-run.'
     );
     expect(advised?.cause).toBe(httpErr);
 
@@ -59,9 +58,8 @@ describe('error advice', () => {
 
     expect(advised).toBeDefined();
     expect(advised?.message).toContain('postman: Bifrost rejected the access token (authenticationError).');
-    expect(advised?.message).toContain('expire after about 1 to 1.5 hours');
-    expect(advised?.message).toContain('postman-resolve-service-token-action');
-    expect(advised?.message).toContain('POST https://api.getpostman.com/service-account-tokens');
+    expect(advised?.message).toContain('human-user session access token');
+    expect(advised?.message).toContain('cannot be minted from a PMAK');
   });
 
   it('403 "You are not authorized to perform this action" with workspace-team-id context -> "...GET https://api.getpostman.com/teams lists valid sub-team ids..."', () => {
@@ -185,5 +183,45 @@ describe('error advice', () => {
     expect(fromBody).toBeDefined();
     expect(fromBody?.message).toContain(REDACTED);
     expect(fromBody?.message).not.toContain('fake-token-abc123');
+  });
+
+  it('masks a secret before truncating the retained cause body', () => {
+    const secret = 'CROSS_BOUNDARY_SECRET_MATERIAL';
+    const marker = 'You are not authorized to perform this action';
+    const body = `${marker}${'x'.repeat(792 - marker.length)}${secret}`;
+    const advised = adviseFromBifrostBody(
+      403,
+      body,
+      createContext({ mask: createSecretMasker([secret]) })
+    );
+
+    expect(advised).toBeDefined();
+    expect(advised?.cause).toBeInstanceOf(Error);
+    const causeMessage = (advised?.cause as Error).message;
+    expect(causeMessage).not.toContain('CROSS_BO');
+    expect(causeMessage).not.toContain(secret);
+  });
+
+  it('collapses multiline operation/team context to one masked line and keeps remediation', () => {
+    const secret = 'advice-secret-token-xyz';
+    const mask = createSecretMasker([secret]);
+    const advised = adviseFromHttpError(
+      bifrostHttpError(403, 'You are not authorized to perform this action'),
+      createContext({
+        operation: `git onboarding\nfor repo`,
+        sessionTeamId: `1334\r7347`,
+        sessionRoles: [`role\n${secret}`],
+        workspaceTeamId: `132\n109`,
+        mask
+      })
+    );
+
+    expect(advised).toBeDefined();
+    expect(advised!.message).not.toMatch(/[\r\n]/);
+    expect(advised!.message).not.toContain(secret);
+    expect(advised!.message).toContain(REDACTED);
+    expect(advised!.message).toContain('403');
+    expect(advised!.message).toContain('GET https://api.getpostman.com/teams');
+    expect(advised!.message).toContain('git onboarding');
   });
 });

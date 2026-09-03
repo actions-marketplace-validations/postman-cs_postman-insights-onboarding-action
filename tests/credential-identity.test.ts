@@ -1,18 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { HttpError } from '../src/lib/http-error.js';
+import { HttpError } from '@postman-cs/automation-core';
 import { createSecretMasker, REDACTED } from '../src/lib/secrets.js';
 import {
   __resetIdentityMemo,
   crossCheckIdentities,
   formatIdentityLine,
   getMemoizedSessionIdentity,
+  getSessionResolutionFailure,
   resolvePmakIdentity,
   resolveSessionIdentity,
   runCredentialPreflight,
   type CredentialIdentity
 } from '../src/lib/credential-identity.js';
 import { adviseFromHttpError } from '../src/lib/error-advice.js';
+import { validateApiKey } from '../src/index.js';
 
 const API_BASE = 'https://api.getpostman.com';
 const IAPUB_BASE = 'https://iapub.postman.co';
@@ -43,7 +45,7 @@ function sessionPayload(team: unknown = 13347347): Record<string, unknown> {
         role: 'member'
       }
     },
-    consumerType: 'service_account',
+    consumerType: 'user',
     token: 'session-token-must-never-copy'
   };
 }
@@ -66,7 +68,7 @@ function sessionIdentity(overrides: Partial<CredentialIdentity> = {}): Credentia
     teamId: '13347347',
     teamDomain: 'field-services-v12-demo',
     roles: ['collection-editor'],
-    consumerType: 'service_account',
+    consumerType: 'user',
     ...overrides
   };
 }
@@ -128,6 +130,26 @@ describe('credential identity', () => {
     );
   });
 
+  it('accepts only a human-user PMAK shape and never mints', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      jsonResponse({ user: { username: 'human-user', email: 'human@example.test', teamId: 10490519 } })
+    );
+    vi.stubGlobal('fetch', fetchImpl);
+
+    await expect(validateApiKey('human-pmak')).resolves.toEqual({ valid: true, teamId: '10490519' });
+    expect(fetchImpl.mock.calls.map(([url]) => String(url))).not.toContain(`${API_BASE}/service-account-tokens`);
+    vi.unstubAllGlobals();
+  });
+
+  it('rejects service-account PMAK shape before writes without mint diagnosis text', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () =>
+      jsonResponse({ user: { username: null, email: null, teamId: 10490519 } })
+    ));
+
+    await expect(validateApiKey('service-pmak')).rejects.toThrow('Insights requires a human-user PMAK');
+    vi.unstubAllGlobals();
+  });
+
   it('resolvePmakIdentity tolerates missing user.teamId (returns identity without teamId)', async () => {
     const identity = await resolvePmakIdentity({
       apiBaseUrl: API_BASE,
@@ -178,7 +200,7 @@ describe('credential identity', () => {
       teamId: '13347347',
       teamDomain: 'field-services-v12-demo',
       roles: ['collection-editor'],
-      consumerType: 'service_account'
+      consumerType: 'user'
     });
     const [url, init] = fetchImpl.mock.calls[0];
     expect(url).toBe(`${IAPUB_BASE}/api/sessions/current`);
@@ -196,7 +218,7 @@ describe('credential identity', () => {
     const fetchImpl = sessionFetch({
       session: {
         status: 'active',
-        consumerType: 'service_account',
+        consumerType: 'user',
         identity: { user: 55363555, team: 10490519, domain: 'jared-demo' },
         data: {
           user: {
@@ -223,12 +245,60 @@ describe('credential identity', () => {
       teamName: "Jared's Demo",
       teamDomain: 'jared-demo',
       roles: ['admin', 'user'],
-      consumerType: 'service_account'
+      consumerType: 'user'
     });
     expect(JSON.stringify(identity)).not.toContain('session-token-must-never-copy');
     expect(formatIdentityLine(identity!, passthroughMask)).toBe(
       "postman: access-token session identity - team 10490519 (Jared's Demo), domain jared-demo [source: iapub/sessions]"
     );
+  });
+
+  it('normalizes the live human user_type when iapub omits consumerType', async () => {
+    const identity = await resolveSessionIdentity({
+      iapubBaseUrl: IAPUB_BASE,
+      accessToken: 'access-token-human-user-type',
+      fetchImpl: sessionFetch({
+        session: {
+          status: 'active',
+          consumerType: null,
+          identity: { user: 52358261, team: 13347347, domain: 'field-services-v12-demo' },
+          data: {
+            user: {
+              user_type: 'human',
+              name: 'Jared Boynton',
+              teamName: 'Field Services v12 Demo',
+              roles: ['admin', 'api-governance-manager', 'api-catalog-manager'],
+              role: 'admin'
+            }
+          },
+          token: 'session-token-must-never-copy'
+        }
+      })
+    });
+
+    expect(identity).toMatchObject({
+      source: 'iapub/sessions',
+      userId: '52358261',
+      teamId: '13347347',
+      teamDomain: 'field-services-v12-demo',
+      consumerType: 'user'
+    });
+    expect(JSON.stringify(identity)).not.toContain('session-token-must-never-copy');
+  });
+
+  it('preserves a service-account user_type when iapub omits consumerType', async () => {
+    const identity = await resolveSessionIdentity({
+      iapubBaseUrl: IAPUB_BASE,
+      accessToken: 'access-token-service-user-type',
+      fetchImpl: sessionFetch({
+        session: {
+          identity: { user: 55002873, team: 13347347, domain: 'field-services-v12-demo' },
+          data: { user: { user_type: 'service_account' } }
+        }
+      })
+    });
+
+    expect(identity?.consumerType).toBe('service_account');
   });
 
   it('resolveSessionIdentity coerces a numeric identity.team to a string (raw ? String(raw) : undefined)', async () => {
@@ -289,6 +359,27 @@ describe('credential identity', () => {
       })
     });
     expect(network).toBeUndefined();
+  });
+
+  it('fails closed for a service-account access token even in warn mode', async () => {
+    const capture = createLogCapture();
+    await expect(
+      runCredentialPreflight({
+        apiBaseUrl: API_BASE,
+        iapubBaseUrl: IAPUB_BASE,
+        postmanApiKey: 'user-pmak',
+        postmanAccessToken: 'service-token',
+        mode: 'warn',
+        mask: passthroughMask,
+        log: capture.log,
+        fetchImpl: vi.fn<typeof fetch>(async (input) => {
+          if (String(input).endsWith('/me')) {
+            return jsonResponse({ user: { username: 'person', teamId: 10490519 } });
+          }
+          return jsonResponse({ identity: { team: 10490519 }, data: { user: {} }, consumerType: 'service_account' });
+        })
+      })
+    ).rejects.toThrow('consumerType=user');
   });
 
   it('crossCheckIdentities passes when pmak.teamId === session.teamId (incl. org-mode parent==parent, no getTeams needed)', () => {
@@ -359,7 +450,7 @@ describe('credential identity', () => {
     expect(result.message).toContain('jared-demo');
     expect(result.message).toContain('13347347');
     expect(result.message).toContain('field-services-v12-demo');
-    expect(result.message).toContain('re-mint the access token');
+    expect(result.message).toContain('human-user session access token');
   });
 
   it('FAIL never fires when either teamId is undefined or empty', () => {
@@ -477,7 +568,7 @@ describe('credential identity', () => {
 
   });
 
-  it('warns when postman-access-token is a user/session token instead of a service-account token', async () => {
+  it('accepts a user session token for Insights writes', async () => {
     const capture = createLogCapture();
     const fetchImpl = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
@@ -502,13 +593,7 @@ describe('credential identity', () => {
       fetchImpl
     });
 
-    expect(
-      capture.warnings.some((entry) =>
-        entry.includes('deprecation warning') &&
-        entry.includes('consumerType user') &&
-        entry.includes('postman-cs/postman-resolve-service-token-action')
-      )
-    ).toBe(true);
+    expect(capture.warnings).toEqual([]);
   });
 
   it('runCredentialPreflight accepts a pre-resolved pmak identity (validateApiKey reuse) and skips the /me probe', async () => {
@@ -602,5 +687,160 @@ describe('credential identity', () => {
     });
     expect(second?.teamId).toBe('22222222');
     expect(secondFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('event-based session retry', () => {
+  beforeEach(() => {
+    __resetIdentityMemo();
+  });
+
+  function sessionSequence(steps: Array<() => Response>) {
+    let n = 0;
+    return vi.fn<typeof fetch>(async () => {
+      const step = steps[Math.min(n, steps.length - 1)];
+      n += 1;
+      return step();
+    });
+  }
+
+  it('retries a transient 5xx and resolves later, waiting the full-jitter delay via the injected clock', async () => {
+    const sleeps: number[] = [];
+    const fetchImpl = sessionSequence([
+      () => new Response('server error', { status: 503 }),
+      () => jsonResponse(sessionPayload(13347347))
+    ]);
+
+    const identity = await resolveSessionIdentity({
+      iapubBaseUrl: IAPUB_BASE,
+      accessToken: 'retry-5xx',
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+      randomImpl: () => 0.5
+    });
+
+    expect(identity?.teamId).toBe('13347347');
+    expect(sleeps).toEqual([250]);
+    expect(getSessionResolutionFailure()).toBeUndefined();
+  });
+
+  it('honors Retry-After (seconds) on 429 and RateLimit-Reset as fallback, clamped to the max', async () => {
+    const afterSecs: number[] = [];
+    const fetchAfter = sessionSequence([
+      () => new Response('slow', { status: 429, headers: { 'retry-after': '2' } }),
+      () => jsonResponse(sessionPayload(13347347))
+    ]);
+    await resolveSessionIdentity({
+      iapubBaseUrl: IAPUB_BASE,
+      accessToken: 'retry-after',
+      fetchImpl: fetchAfter,
+      sleepImpl: async (ms) => {
+        afterSecs.push(ms);
+      },
+      randomImpl: () => 0.99
+    });
+    expect(afterSecs).toEqual([2000]);
+
+    __resetIdentityMemo();
+    const resets: number[] = [];
+    const fetchReset = sessionSequence([
+      () => new Response('limited', { status: 503, headers: { 'ratelimit-reset': '3' } }),
+      () => jsonResponse(sessionPayload(13347347))
+    ]);
+    await resolveSessionIdentity({
+      iapubBaseUrl: IAPUB_BASE,
+      accessToken: 'ratelimit-reset',
+      fetchImpl: fetchReset,
+      sleepImpl: async (ms) => {
+        resets.push(ms);
+      },
+      randomImpl: () => 0.99
+    });
+    expect(resets).toEqual([3000]);
+
+    __resetIdentityMemo();
+    const clamped: number[] = [];
+    const fetchHuge = sessionSequence([
+      () => new Response('slow', { status: 503, headers: { 'retry-after': '9999' } }),
+      () => jsonResponse(sessionPayload(13347347))
+    ]);
+    await resolveSessionIdentity({
+      iapubBaseUrl: IAPUB_BASE,
+      accessToken: 'retry-after-huge',
+      fetchImpl: fetchHuge,
+      sleepImpl: async (ms) => {
+        clamped.push(ms);
+      },
+      randomImpl: () => 0
+    });
+    expect(clamped).toEqual([8000]);
+  });
+
+  it('does NOT retry or sleep on 401 and classifies auth', async () => {
+    const sleeps: number[] = [];
+    const fetchImpl = sessionSequence([() => new Response('nope', { status: 401 })]);
+    const identity = await resolveSessionIdentity({
+      iapubBaseUrl: IAPUB_BASE,
+      accessToken: 'auth-401',
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      }
+    });
+    expect(identity).toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sleeps).toHaveLength(0);
+    expect(getSessionResolutionFailure()).toBe('auth');
+  });
+
+  it('runCredentialPreflight enforce FAILS closed when the session stays unresolved (auth)', async () => {
+    const capture = createLogCapture();
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/me')) {
+        return jsonResponse({ user: { id: 1, teamId: 10490519, teamName: 'jared-demo' } });
+      }
+      return new Response('expired', { status: 401 });
+    });
+    await expect(
+      runCredentialPreflight({
+        apiBaseUrl: API_BASE,
+        iapubBaseUrl: IAPUB_BASE,
+        postmanApiKey: 'pmak-enforce-unresolved',
+        postmanAccessToken: 'access-token-expired',
+        mode: 'enforce',
+        mask: passthroughMask,
+        log: capture.log,
+        fetchImpl,
+        sleepImpl: async () => undefined
+      })
+    ).rejects.toThrow(/human-user session access token/);
+  });
+
+  it('runCredentialPreflight warn still fails when the user token session is unavailable', async () => {
+    const capture = createLogCapture();
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/me')) {
+        return jsonResponse({ user: { id: 1, teamId: 10490519, teamName: 'jared-demo' } });
+      }
+      return new Response('unavailable', { status: 503 });
+    });
+    await expect(
+      runCredentialPreflight({
+        apiBaseUrl: API_BASE,
+        iapubBaseUrl: IAPUB_BASE,
+        postmanApiKey: 'pmak-warn-unresolved',
+        postmanAccessToken: 'access-token-transient',
+        mode: 'warn',
+        mask: passthroughMask,
+        log: capture.log,
+        fetchImpl,
+        sleepImpl: async () => undefined,
+        randomImpl: () => 0
+      })
+    ).rejects.toThrow(/Insights requires a human-user session access token/);
   });
 });

@@ -24,8 +24,8 @@ inputs:
     description: 'Repository URL for Git onboarding. Auto-detected from CI context when omitted.'
     required: false
   postman-access-token:
-    description: 'Service-account Postman access token for integration API calls. Prefer minting it with postman-resolve-service-token-action.'
-    required: true
+    description: 'Required human-user session access token (x-access-token) for Bifrost and Akita linking calls. Service-account tokens are rejected and this action never mints or refreshes a token from a PMAK.'
+    required: false
   postman-team-id:
     description: 'Explicit Postman team ID for org-mode integration request headers. When omitted, x-entity-team-id is not sent.'
     required: false
@@ -33,12 +33,20 @@ inputs:
     description: 'Optional GitHub token passed as git_api_key when repository auth is required by onboarding/git'
     required: false
   postman-api-key:
-    description: 'Service-account Postman API key (PMAK-*) for the application binding call. Auto-created from postman-access-token when omitted or invalid after a clear 401/403 validation failure.'
+    description: 'Human-user Postman API key (PMAK-*) for observability application binding. It must resolve to the same human user as postman-access-token; service-account PMAKs are rejected.'
     required: false
+  create-api-key:
+    description: 'Explicit opt-in to create a durable Bifrost API key when postman-api-key is omitted or invalid. Default false — never creates timestamp-named orphan keys on ordinary runs. Supported values: true, false.'
+    required: false
+    default: 'false'
   credential-preflight:
-    description: 'Credential identity preflight policy. warn (default) logs a note and continues when postman-api-key and postman-access-token resolve to different parent orgs; enforce fails the run on that condition before any onboarding write. Supported values are warn and enforce.'
+    description: 'Credential identity preflight policy. Both modes require a human-user access token with consumerType=user; enforce additionally fails on parent-org mismatch.'
     required: false
-    default: 'warn'
+    default: 'enforce'
+  service-not-found-policy:
+    description: 'Behavior when the discovered service is absent after polling. fail (default) aborts full linking; warn returns status=not-found without writes. Supported values: fail, warn.'
+    required: false
+    default: 'fail'
   poll-timeout-seconds:
     description: 'Maximum seconds to wait for the service to appear in the discovered list'
     required: false
@@ -55,6 +63,16 @@ inputs:
     description: 'Postman stack profile. Defaults to the public production stack. Marketplace workflows should leave this as prod.'
     required: false
     default: 'prod'
+  branch-strategy:
+    description: Branch-aware sync strategy. legacy (default) keeps branch-blind behavior; publish-gate restricts canonical writes to the canonical branch and skips on other branches; preview additionally maintains suffixed per-branch preview asset sets.
+    required: false
+    default: legacy
+  canonical-branch:
+    description: Explicit canonical branch (the sole writer of canonical assets). Defaults to the provider-resolved default branch.
+    required: false
+  channels:
+    description: Comma-separated channel map for long-lived promotion branches.
+    required: false
 outputs:
   discovered-service-id:
     description: 'Numeric ID from the API Catalog discovered-services list'
@@ -67,7 +85,11 @@ outputs:
   verification-token:
     description: 'Insights team verification token (tvt_*) for DaemonSet telemetry'
   status:
-    description: 'Onboarding result: success, not-found, or error'
+    description: 'Onboarding result: success, not-found, or error. skipped when the branch-aware gate skips the run; pending only until the run completes'
+  sync-status:
+    description: 'Branch-aware sync status: synced, skipped-branch-gate, or empty under branch-strategy legacy.'
+  branch-decision:
+    description: Serialized BranchDecision JSON for downstream actions (also exported as POSTMAN_BRANCH_DECISION).
 runs:
   using: 'node24'
   main: 'dist/action.cjs'

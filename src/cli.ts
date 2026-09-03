@@ -1,24 +1,65 @@
-import { realpathSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { realpathSync, readFileSync } from 'node:fs';
+import { lstat, mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
+  createInsightsBifrostClient,
+  createInsightsTokenProvider,
+  assertWritingInputs,
+  decideBranchTier,
+  DEFAULT_POSTMAN_API_BASE,
   resolveApiKeyAndTeamId,
   resolveInputs,
   runCredentialPreflightForInputs,
   runOnboarding,
+  validateApiKey,
   type Reporter
 } from './index.js';
-import { BifrostCatalogClient } from './lib/bifrost-client.js';
-import { sleep } from './lib/retry.js';
+import { serializeBranchDecision } from './lib/repo-branch-decision.js';
+import { sleep } from '@postman-cs/automation-core';
 import { getMemoizedSessionIdentity } from './lib/credential-identity.js';
-import { createTelemetryContext } from '@postman-cse/automation-telemetry-core';
+import { normalizedInputEnvName, runnerInputEnvName } from './lib/input.js';
+import { createTelemetryContext } from '@postman-cs/automation-core';
+import { resolveActionVersion } from './action-version.js';
+import { toOneLine } from './lib/secrets.js';
 
-interface CliConfig {
+const INPUT_NAMES = [
+  'project-name',
+  'workspace-id',
+  'environment-id',
+  'system-environment-id',
+  'cluster-name',
+  'repo-url',
+  'postman-access-token',
+  'postman-api-key',
+  'create-api-key',
+  'credential-preflight',
+  'service-not-found-policy',
+  'postman-team-id',
+  'github-token',
+  'poll-timeout-seconds',
+  'poll-interval-seconds',
+  'postman-region',
+  'postman-stack',
+  'branch-strategy',
+  'canonical-branch',
+  'channels'
+] as const;
+
+const OUTPUT_OPTION_NAMES = ['result-json', 'dotenv-path'] as const;
+
+interface CliRunConfig {
+  kind: 'run';
   inputEnv: NodeJS.ProcessEnv;
-  resultJsonPath: string;
+  resultJsonPath?: string;
   dotenvPath?: string;
 }
+
+export type ParsedCliArgs =
+  | { kind: 'help' }
+  | { kind: 'version' }
+  | CliRunConfig;
 
 export interface CliRuntime {
   env?: NodeJS.ProcessEnv;
@@ -48,59 +89,132 @@ export class ConsoleReporter implements Reporter {
     for (const secret of this.secretValues) {
       masked = masked.replaceAll(secret, '***');
     }
-    return masked;
+    return toOneLine(masked);
   }
-}
-
-function readFlag(argv: string[], name: string): string | undefined {
-  const prefix = `--${name}=`;
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === `--${name}`) {
-      return argv[index + 1];
-    }
-    if (arg?.startsWith(prefix)) {
-      return arg.slice(prefix.length);
-    }
-  }
-  return undefined;
 }
 
 export function normalizeCliFlag(name: string): string {
-  return `INPUT_${name.replace(/-/g, '_').toUpperCase()}`;
+  return normalizedInputEnvName(name);
 }
 
-export function parseCliArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): CliConfig {
-  const inputNames = [
-    'project-name',
-    'workspace-id',
-    'environment-id',
-    'system-environment-id',
-    'cluster-name',
-    'repo-url',
-    'postman-access-token',
-    'postman-api-key',
-    'credential-preflight',
-    'postman-team-id',
-    'github-token',
-    'poll-timeout-seconds',
-    'poll-interval-seconds',
-    'postman-region',
-    'postman-stack'
-  ];
+// Embedded at SEA build time via esbuild --define (scripts/build-sea.sh); the
+// standalone binary ships no package.json. The npm/Action bundles define this as
+// a constant undefined, so the guard below is inert there.
+declare const __SEA_VERSION__: string | undefined;
 
-  const inputEnv: NodeJS.ProcessEnv = { ...env };
-  for (const name of inputNames) {
-    const value = readFlag(argv, name);
-    if (value !== undefined) {
-      inputEnv[normalizeCliFlag(name)] = value;
+function resolvePackageVersion(): string {
+  if (typeof __SEA_VERSION__ === 'string' && __SEA_VERSION__) {
+    return __SEA_VERSION__;
+  }
+  const candidates: string[] = [];
+  if (typeof __filename === 'string') {
+    // Present in the esbuild CJS bundle (dist/cli.cjs -> ../package.json).
+    candidates.push(path.join(path.dirname(__filename), '..', 'package.json'));
+  }
+  // vitest/ESM and local smoke: package.json at cwd.
+  candidates.push(path.join(process.cwd(), 'package.json'));
+
+  for (const candidate of candidates) {
+    try {
+      const packageJson = JSON.parse(readFileSync(candidate, 'utf8')) as {
+        name?: string;
+        version?: string;
+      };
+      if (packageJson.name === '@postman-cs/onboarding-insights' && packageJson.version) {
+        return String(packageJson.version).trim();
+      }
+    } catch {
+      // try next candidate
     }
+  }
+  return resolveActionVersion();
+}
+
+function renderHelp(): string {
+  const inputFlags = INPUT_NAMES.map((name) => `  --${name} <value>`).join('\n');
+  return [
+    'Usage: postman-insights-onboard [options]',
+    '',
+    'Options:',
+    inputFlags,
+    '  --result-json <path>   Optional JSON output file (opt-in)',
+    '  --dotenv-path <path>   Optional dotenv output file',
+    '  --help                 Show this help and exit',
+    '  --version              Print version and exit',
+    ''
+  ].join('\n');
+}
+
+export function parseCliArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): ParsedCliArgs {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    return { kind: 'help' };
+  }
+  if (argv.includes('--version') || argv.includes('-V')) {
+    return { kind: 'version' };
+  }
+
+  const allowed = new Set<string>([...INPUT_NAMES, ...OUTPUT_OPTION_NAMES]);
+  const seen = new Set<string>();
+  const inputEnv: NodeJS.ProcessEnv = { ...env };
+  let resultJsonPath: string | undefined;
+  let dotenvPath: string | undefined;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (!arg) {
+      continue;
+    }
+    if (!arg.startsWith('--')) {
+      throw new Error(
+        `Unexpected positional argument at argv[${index}]; use named --<input> options (see --help)`
+      );
+    }
+
+    const equalsIndex = arg.indexOf('=');
+    const name = equalsIndex >= 0 ? arg.slice(2, equalsIndex) : arg.slice(2);
+    const safeName = toOneLine(name);
+    if (!allowed.has(name)) {
+      throw new Error(`Unknown option: --${safeName}`);
+    }
+    if (seen.has(name)) {
+      throw new Error(`Duplicate option: --${safeName}`);
+    }
+
+    let value: string | undefined;
+    if (equalsIndex >= 0) {
+      value = arg.slice(equalsIndex + 1);
+    } else {
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith('--')) {
+        throw new Error(`Missing value for --${safeName}`);
+      }
+      value = next;
+      index += 1;
+    }
+    if (value.length === 0) {
+      throw new Error(`Missing value for --${safeName}`);
+    }
+
+    seen.add(name);
+    if (name === 'result-json') {
+      resultJsonPath = value;
+      continue;
+    }
+    if (name === 'dotenv-path') {
+      dotenvPath = value;
+      continue;
+    }
+    const normalizedName = normalizedInputEnvName(name);
+    delete inputEnv[runnerInputEnvName(name)];
+    delete inputEnv[normalizedName];
+    inputEnv[normalizedName] = value;
   }
 
   return {
+    kind: 'run',
     inputEnv,
-    resultJsonPath: readFlag(argv, 'result-json') ?? 'postman-insights-onboarding-result.json',
-    dotenvPath: readFlag(argv, 'dotenv-path')
+    resultJsonPath,
+    dotenvPath
   };
 }
 
@@ -114,18 +228,123 @@ export function toDotenv(outputs: Record<string, string>): string {
     .join('\n');
 }
 
+function assertWithinWorkspace(workspaceRoot: string, resolved: string, filePath: string): void {
+  const relative = path.relative(workspaceRoot, resolved);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Output path must stay within workspace: ${toOneLine(filePath)}`);
+  }
+}
+
+async function findExistingAncestor(candidate: string): Promise<string> {
+  let current = candidate;
+  while (true) {
+    try {
+      return await realpath(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw error;
+      }
+      current = parent;
+    }
+  }
+}
+
+async function validateOutputPath(filePath: string | undefined): Promise<void> {
+  if (!filePath) {
+    return;
+  }
+  const workspaceRoot = await realpath(process.cwd());
+  const resolved = path.resolve(workspaceRoot, filePath);
+  assertWithinWorkspace(workspaceRoot, resolved, filePath);
+  const existingParent = await findExistingAncestor(path.dirname(resolved));
+  assertWithinWorkspace(workspaceRoot, existingParent, filePath);
+}
+
+type AncestorGuard = Array<{ absolutePath: string; identity: string }>;
+
+async function captureAncestorGuard(workspaceRoot: string, parent: string): Promise<AncestorGuard> {
+  const relative = path.relative(workspaceRoot, parent);
+  assertWithinWorkspace(workspaceRoot, parent, parent);
+  const paths = [workspaceRoot];
+  let current = workspaceRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    paths.push(current);
+  }
+  const guard: AncestorGuard = [];
+  for (const absolutePath of paths) {
+    const fileStat = await lstat(absolutePath);
+    if (fileStat.isSymbolicLink() || !fileStat.isDirectory()) {
+      throw new Error(`Output ancestor must remain a real directory: ${absolutePath}`);
+    }
+    const identity = fileStat.ino === 0
+      ? await realpath(absolutePath)
+      : `${fileStat.dev}:${fileStat.ino}`;
+    guard.push({ absolutePath, identity });
+  }
+  return guard;
+}
+
+async function assertAncestorGuard(guard: AncestorGuard): Promise<void> {
+  for (const expected of guard) {
+    let fileStat;
+    try {
+      fileStat = await lstat(expected.absolutePath);
+    } catch (error) {
+      throw new Error(`Output ancestor changed during atomic write: ${expected.absolutePath}`, { cause: error });
+    }
+    const identity = fileStat.ino === 0
+      ? await realpath(expected.absolutePath)
+      : `${fileStat.dev}:${fileStat.ino}`;
+    if (fileStat.isSymbolicLink() || !fileStat.isDirectory() || identity !== expected.identity) {
+      throw new Error(`Output ancestor changed during atomic write: ${expected.absolutePath}`);
+    }
+  }
+}
+
+export async function writeAtomicFile(
+  filePath: string,
+  content: string,
+  beforePublish?: () => Promise<void>
+): Promise<void> {
+  const workspaceRoot = await realpath(process.cwd());
+  const resolved = path.resolve(workspaceRoot, filePath);
+  assertWithinWorkspace(workspaceRoot, resolved, filePath);
+  await mkdir(path.dirname(resolved), { recursive: true });
+  const resolvedParent = await realpath(path.dirname(resolved));
+  assertWithinWorkspace(workspaceRoot, resolvedParent, filePath);
+
+  const safeTarget = path.join(resolvedParent, path.basename(resolved));
+  const ancestorGuard = await captureAncestorGuard(workspaceRoot, resolvedParent);
+  const tempPath = path.join(
+    resolvedParent,
+    `.${path.basename(resolved)}.${process.pid}.${randomUUID()}.tmp`
+  );
+  try {
+    await assertAncestorGuard(ancestorGuard);
+    await writeFile(tempPath, content, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    await beforePublish?.();
+    await assertAncestorGuard(ancestorGuard);
+    await rename(tempPath, safeTarget);
+  } finally {
+    try {
+      await assertAncestorGuard(ancestorGuard);
+      await rm(tempPath, { force: true });
+    } catch {
+      // Never clean through a path whose ancestor identity changed.
+    }
+  }
+}
+
 async function writeOptionalFile(filePath: string | undefined, content: string): Promise<void> {
   if (!filePath) {
     return;
   }
-  const workspaceRoot = path.resolve(process.cwd());
-  const resolved = path.resolve(workspaceRoot, filePath);
-  const relative = path.relative(workspaceRoot, resolved);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new Error(`Output path must stay within workspace: ${filePath}`);
-  }
-  await mkdir(path.dirname(resolved), { recursive: true });
-  await writeFile(resolved, content, 'utf8');
+  await writeAtomicFile(filePath, content);
 }
 
 function toOutputs(result: Awaited<ReturnType<typeof runOnboarding>>): Record<string, string> {
@@ -144,11 +363,45 @@ export async function runCli(
   runtime: CliRuntime = {}
 ): Promise<void> {
   const env = runtime.env ?? process.env;
-  const config = parseCliArgs(argv, env);
-  const inputs = resolveInputs(config.inputEnv);
+  const writeStdout = runtime.writeStdout ?? ((chunk: string) => process.stdout.write(chunk));
+  const parsed = parseCliArgs(argv, env);
+
+  if (parsed.kind === 'help') {
+    writeStdout(renderHelp());
+    return;
+  }
+  if (parsed.kind === 'version') {
+    writeStdout(`${resolvePackageVersion()}\n`);
+    return;
+  }
+
+  const config = parsed;
+  await validateOutputPath(config.resultJsonPath);
+  await validateOutputPath(config.dotenvPath);
+  const inputs = resolveInputs(config.inputEnv, true);
 
   const reporter = new ConsoleReporter();
-  reporter.setSecret(inputs.postmanAccessToken);
+  const branchDecision = decideBranchTier(inputs, config.inputEnv);
+  if (branchDecision.tier !== 'legacy' && branchDecision.tier !== 'canonical') {
+    const outputs = {
+      'discovered-service-id': '',
+      'discovered-service-name': '',
+      'collection-id': '',
+      'application-id': '',
+      'verification-token': '',
+      status: 'skipped',
+      'sync-status': 'skipped-branch-gate',
+      'branch-decision': serializeBranchDecision(branchDecision)
+    };
+    const jsonOutput = JSON.stringify(outputs, null, 2);
+    await writeOptionalFile(config.resultJsonPath, jsonOutput);
+    await writeOptionalFile(config.dotenvPath, toDotenv(outputs));
+    writeStdout(`${jsonOutput}\n`);
+    return;
+  }
+  assertWritingInputs(inputs);
+
+  if (inputs.postmanAccessToken) reporter.setSecret(inputs.postmanAccessToken);
   if (inputs.postmanApiKey) {
     reporter.setSecret(inputs.postmanApiKey);
   }
@@ -156,41 +409,62 @@ export async function runCli(
     reporter.setSecret(inputs.githubToken);
   }
 
-  const preliminaryClient = new BifrostCatalogClient({
-    accessToken: inputs.postmanAccessToken,
-    teamId: inputs.postmanTeamId,
-    apiKey: inputs.postmanApiKey,
-    bifrostBaseUrl: inputs.postmanBifrostBase,
-    observabilityBaseUrl: inputs.postmanObservabilityBase,
-    observabilityEnv: inputs.postmanObservabilityEnv
-  });
-
-  const { apiKey, teamId, pmakIdentity } = await resolveApiKeyAndTeamId(
+  const tokenProvider = createInsightsTokenProvider(inputs, reporter);
+  const preliminaryClient = createInsightsBifrostClient(
     inputs,
-    preliminaryClient,
-    reporter
+    tokenProvider,
+    inputs.postmanTeamId,
+    inputs.postmanApiKey
   );
 
-  const telemetry = createTelemetryContext({ action: 'postman-insights-onboarding-action', logger: reporter });
-  telemetry.setTeamId(inputs.postmanTeamId || pmakIdentity?.teamId);
-  if (apiKey) {
-    reporter.setSecret(apiKey);
-  }
-
+  const telemetry = createTelemetryContext({ action: 'postman-insights-onboarding-action', actionVersion: resolveActionVersion(), logger: reporter });
+  telemetry.setTeamId(inputs.postmanTeamId);
   let result: Awaited<ReturnType<typeof runOnboarding>>;
   try {
-    // Credential preflight can throw under enforce; keep it inside the try so a
-    // known-team credential failure still routes through emitCompletion('failure').
-    await runCredentialPreflightForInputs(inputs, pmakIdentity, reporter);
+    let preflightPmakIdentity;
+    if (inputs.postmanApiKey) {
+      const validated = await validateApiKey(
+        inputs.postmanApiKey,
+        inputs.postmanApiBase || DEFAULT_POSTMAN_API_BASE
+      );
+      if (validated.valid) {
+        preflightPmakIdentity = { source: 'pmak/me' as const, teamId: validated.teamId };
+      } else if (!inputs.createApiKey) {
+        throw new Error(
+          'postman-api-key is invalid or expired. Provide a valid key, or set create-api-key=true to opt in to durable Bifrost API-key creation.'
+        );
+      }
+    } else if (!inputs.createApiKey) {
+      throw new Error(
+        'postman-api-key is required for application binding. Provide a valid key, or set create-api-key=true to opt in to durable Bifrost API-key creation.'
+      );
+    }
 
-    const client = new BifrostCatalogClient({
-      accessToken: inputs.postmanAccessToken,
-      teamId,
-      apiKey,
-      bifrostBaseUrl: inputs.postmanBifrostBase,
-      observabilityBaseUrl: inputs.postmanObservabilityBase,
-      observabilityEnv: inputs.postmanObservabilityEnv
-    });
+    await runCredentialPreflightForInputs(
+      inputs,
+      preflightPmakIdentity,
+      reporter,
+      undefined,
+      tokenProvider.current()
+    );
+
+    const { apiKey, teamId, pmakIdentity } = await resolveApiKeyAndTeamId(inputs, preliminaryClient, reporter);
+    telemetry.setTeamId(inputs.postmanTeamId || pmakIdentity?.teamId);
+    reporter.setSecret(apiKey);
+
+    const activeTokenProvider = tokenProvider;
+
+    if (pmakIdentity?.teamId !== preflightPmakIdentity?.teamId) {
+      await runCredentialPreflightForInputs(
+        inputs,
+        pmakIdentity,
+        reporter,
+        undefined,
+        activeTokenProvider.current()
+      );
+    }
+
+    const client = createInsightsBifrostClient(inputs, activeTokenProvider, teamId, apiKey);
 
     result = await (runtime.executeOnboarding ?? runOnboarding)(
       inputs,
@@ -213,7 +487,6 @@ export async function runCli(
   await writeOptionalFile(config.resultJsonPath, jsonOutput);
   await writeOptionalFile(config.dotenvPath, toDotenv(outputs));
 
-  const writeStdout = runtime.writeStdout ?? ((chunk: string) => process.stdout.write(chunk));
   writeStdout(`${jsonOutput}\n`);
 }
 
@@ -234,7 +507,7 @@ function isEntrypoint(currentPath: string, entrypointPath: string | undefined): 
 if (isEntrypoint(currentModulePath, entrypoint)) {
   runCli().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`${message}\n`);
+    process.stderr.write(`${toOneLine(message)}\n`);
     process.exitCode = 1;
   });
 }

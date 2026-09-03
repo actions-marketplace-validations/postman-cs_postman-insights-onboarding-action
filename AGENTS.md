@@ -1,41 +1,66 @@
 # postman-insights-onboarding-action
 
-Links Postman Insights discovered services to API Catalog workspaces and git repositories after deployment, so every service the Insights agent finds lands in the catalog with a collection, a repo link, and live telemetry. Linking runs through Bifrost. Dual entry: GitHub Action (`dist/index.cjs` / `dist/action.cjs`) and CLI (`dist/cli.cjs`, bin `postman-insights-onboard`).
+Links Postman Insights discovered services to API Catalog workspaces + git repos after deployment, so every service Insights agent finds lands in catalog w/ collection, repo link, live telemetry. Linking runs through Bifrost. Dual entry: GitHub Action (`dist/index.cjs`/`dist/action.cjs`) + CLI (`dist/cli.cjs`, bin `postman-insights-onboard`).
 
 ## Structure
 
 ```
 src/
-  index.ts                     # GitHub Action entry: reads inputs, links services, sets outputs
-  main.ts                      # Core orchestration: resolve services -> link workspace + repo
-  cli.ts                       # CLI adapter for non-GitHub CI
-  contracts.ts                 # Input/output type definitions
+  index.ts                     # Action entry: reads inputs, links, sets outputs
+  main.ts                      # Core: resolve services -> link workspace + repo
+  cli.ts                       # CLI adapter
+  contracts.ts                 # I/O types
   lib/
-    bifrost-client.ts          # Bifrost adapter (Insights service linking, workspace/repo association)
+    input.ts                   # Shared Action/CLI INPUT_* adapter
+    bifrost-client.ts          # Bifrost adapter (Insights linking, workspace/repo association)
     credential-identity.ts     # Session identity (iapub + access token) for team scope
-    postman/
-      base-urls.ts             # Postman/Bifrost base URL resolution
-    http-error.ts              # Typed HTTP error class
-    retry.ts                   # Exponential backoff
-    secrets.ts                 # Secret masking utility
-    error-advice.ts            # User-facing remediation hints
+    postman/base-urls.ts       # Base URL resolution
+    http-error.ts, retry.ts, secrets.ts, error-advice.ts
 tests/
 ```
 
 ## Commands
 
 ```bash
-npm ci && npm test && npm run typecheck && npm run build
-npm run check:dist   # build + git diff --exit-code (CI integrity)
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm run verify:dist:assert  # read-only: shebang/exec/census/builtins + git diff
+npm run verify:dist         # rebuild + git diff + assert
 ```
 
 ## Key Behaviors
 
-- **Service linking**: Resolves Insights-discovered services and associates each with an API Catalog workspace and the originating git repository via Bifrost.
-- **Team scope**: Derived from session identity (`credential-identity.ts`); `POSTMAN_TEAM_ID` is an explicit org-mode override for `x-entity-team-id`, otherwise Bifrost infers team context.
-- **Governance credential**: Uses the access token for Bifrost calls (it can expire); the API key handles standard Postman API operations.
+- **Service linking**: Resolves Insights-discovered services, associates each w/ API Catalog workspace + originating git repo via Bifrost.
+- **Team scope**: From session identity (`credential-identity.ts`). `POSTMAN_TEAM_ID` = explicit org-mode override for `x-entity-team-id`; otherwise Bifrost infers team context.
+- **Governance credential**: Uses access token for Bifrost calls (can expire). `BifrostCatalogClient` takes `AccessTokenProvider`, re-mints token once on 401/UNAUTHENTICATED for `api-catalog` path. `akita` (Insights) path = platform wall for service-account identities: 401 "Postman User not found" on every route (api-catalog returns 200 w/ same token). `createApplication` 401s on both `x-access-token` + `x-api-key` for SA — completing Insights acknowledgment needs token w/ Postman *user* identity. Proof: `scripts/probe-insights-akita.ts`.
 
 ## Gotchas
 
-- Build emits three bundles: `index.cjs`, `action.cjs`, and `cli.cjs`. Wire pre-link logic into the shared code path all three entries call, so every bundle picks it up.
-- If Bifrost linking fails, verify the proxy service/path and auth headers with curl before changing code.
+- Build emits three bundles: `index.cjs`, `action.cjs`, `cli.cjs`. Wire pre-link logic into shared code path all three entries call.
+- If Bifrost linking fails, verify proxy service/path + auth headers w/ curl before changing code.
+- Never log access tokens, PMAKs, credentials, or secrets; mask sensitive output.
+
+## CI
+
+`.github/workflows/ci.yml` bundles once, queues at most two checks on one runner. Typecheck once. Dist read-only `verify:dist:assert`; no pack race. Every check prints `::group::` result even on failure.
+
+See workspace `../../docs/CI.md` for shared rationale.
+
+## Releases
+
+Tags are an **output** of passing run, never input. Never push release tags by hand; `.githooks/pre-push` rejects them.
+
+- `.github/workflows/auto-release.yml` runs on every push to `main` and drives `scripts/release-cut.mjs`.
+- `node scripts/release-cut.mjs --plan` reports pending cut (fetch tags first). `--execute` bumps, rebuilds `dist/`, runs typecheck/lint/test, commits, re-verifies committed bytes, then tags last.
+- Version comes from highest tag ever cut, not `package.json`. Existing tags are burnt and skipped, so failed cut never reuses or rewinds version.
+- Conventional-commit type picks bump; `chore`/`ci`/`build`/`test`/`style` alone cut nothing.
+- Release commit lives only on tag. `main` requires pull requests; release commit is reachable from tag, which is ref `release.yml` reads.
+- `main` requires pull requests and green `ready` + `build-and-smoke` checks (admins included, no bypass). Merge with `gh pr checks <n> --watch --fail-fast && gh pr merge <n> --merge --delete-branch`; never `--admin`.
+- `.githooks/pre-push` runs typecheck, lint, and test before every branch push.
+- `RELEASE_POLICY.md` holds full contract.
+
+## Anti-Patterns
+
+- Never hardcode secrets, tokens, or absolute paths in durable memory

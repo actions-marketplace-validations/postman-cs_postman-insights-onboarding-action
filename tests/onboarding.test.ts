@@ -1,15 +1,41 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import {
+  parseCreateApiKey,
   parsePreflightMode,
+  parseServiceNotFoundPolicy,
   runCredentialPreflightForInputs,
   runOnboarding,
   resolveApiKeyAndTeamId,
   resolveInputs,
   validateApiKey,
   type ActionInputs,
+  type Reporter,
 } from '../src/index.js';
+import { REDACTED } from '../src/lib/secrets.js';
 import { BifrostCatalogClient, type DiscoveredService } from '../src/lib/bifrost-client.js';
 import { __resetIdentityMemo } from '../src/lib/credential-identity.js';
+
+function createCapturingReporter(): {
+  infos: string[];
+  warnings: string[];
+  reporter: Reporter;
+} {
+  const infos: string[] = [];
+  const warnings: string[] = [];
+  return {
+    infos,
+    warnings,
+    reporter: {
+      info: (message: string) => {
+        infos.push(message);
+      },
+      warning: (message: string) => {
+        warnings.push(message);
+      },
+      setSecret: () => {},
+    },
+  };
+}
 
 function makeInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
   return {
@@ -24,6 +50,8 @@ function makeInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     postmanTeamId: '14103640',
     githubToken: 'ghp_test',
     credentialPreflight: 'warn',
+    createApiKey: false,
+    serviceNotFoundPolicy: 'warn',
     pollTimeoutSeconds: 5,
     pollIntervalSeconds: 1,
     postmanRegion: 'us',
@@ -84,7 +112,7 @@ describe('runOnboarding', () => {
       gitRepositoryUrl: 'https://github.com/postman-cs/af-cards-activation',
       gitApiKey: 'ghp_test',
     });
-    expect(client.createApplication).toHaveBeenCalledWith('ws-123', '8bfa188b');
+    expect(client.createApplication).toHaveBeenCalledWith('ws-123', '8bfa188b', 'svc_test123');
   });
 
   it('returns not-found when service is not discovered within timeout', async () => {
@@ -132,6 +160,118 @@ describe('runOnboarding', () => {
     expect(result.status).toBe('success');
     expect(client.acknowledgeOnboarding).toHaveBeenCalledWith('svc_test123', 'ws-123', '8bfa188b');
   });
+
+  it('emits success diagnostics with concrete service/workspace/provider IDs', async () => {
+    const client = makeClient();
+    const { infos, warnings, reporter } = createCapturingReporter();
+
+    const result = await runOnboarding(
+      makeInputs({ systemEnvironmentId: '8bfa188b' }),
+      client,
+      vi.fn(),
+      reporter
+    );
+    expect(result.status).toBe('success');
+    expect(warnings).toHaveLength(0);
+    expect(infos.some((entry) => entry.includes('24701') && entry.includes('ws-123'))).toBe(true);
+    expect(infos.some((entry) => entry.includes('svc_test123'))).toBe(true);
+    expect(infos.some((entry) => entry.includes('app-xyz'))).toBe(true);
+    expect(infos.some((entry) => entry.includes('col-abc'))).toBe(true);
+    expect(infos.some((entry) => entry.includes('se-catalog-demo/af-cards-activation'))).toBe(true);
+    // Same one-line diagnostic helpers feed runAction success/not-found operator logs.
+    expect(infos.every((entry) => !/[\r\n]/.test(entry))).toBe(true);
+    expect(
+      infos.some(
+        (entry) =>
+          entry.includes('Application binding created') &&
+          entry.includes('app-xyz') &&
+          entry.includes('svc_test123')
+      )
+    ).toBe(true);
+  });
+
+  it('emits partial-success verification-token warning with concrete workspace remediation', async () => {
+    const client = makeClient({
+      getTeamVerificationToken: vi.fn().mockResolvedValue(null),
+    });
+    const { warnings, reporter } = createCapturingReporter();
+
+    const result = await runOnboarding(
+      makeInputs({ systemEnvironmentId: '8bfa188b' }),
+      client,
+      vi.fn(),
+      reporter
+    );
+    expect(result.status).toBe('success');
+    expect(result.verificationToken).toBeNull();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/ws-123/);
+    expect(warnings[0]).toMatch(/linking already completed/i);
+    expect(warnings[0]).toMatch(/endpoint returned no token/i);
+    expect(warnings[0]).toMatch(/Verify workspace\/team access and rerun/i);
+    expect(warnings[0]).not.toMatch(/[\r\n]/);
+  });
+
+  it('emits not-found warning with concrete canonical identity and remediation', async () => {
+    const client = makeClient({
+      listDiscoveredServices: vi.fn().mockResolvedValue([]),
+    });
+    const { warnings, reporter } = createCapturingReporter();
+
+    const result = await runOnboarding(
+      makeInputs({ pollTimeoutSeconds: 0, serviceNotFoundPolicy: 'warn' }),
+      client,
+      vi.fn(),
+      reporter
+    );
+    expect(result.status).toBe('not-found');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/af-cards-activation/);
+    expect(warnings[0]).toMatch(/se-catalog-demo/);
+    expect(warnings[0]).toMatch(/canonical "se-catalog-demo\/af-cards-activation"/);
+    expect(warnings[0]).toMatch(/Verify the access token team scope/i);
+    expect(warnings[0]).not.toMatch(/[\r\n]/);
+    // Exercises the same one-line success/not-found context formatting helpers
+    // used by runAction final operator logs (without a runAction harness).
+    expect(warnings[0]).toMatch(/workspace|canonical|project|af-cards-activation/i);
+  });
+
+  it('wraps ambiguous discovered-service identity errors with workspace/canonical remediation and skips writes', async () => {
+    const ambiguous: DiscoveredService[] = [
+      { ...sampleService, id: 1, name: 'cluster-a/af-cards-activation' },
+      { ...sampleService, id: 2, name: 'cluster-b/af-cards-activation' },
+    ];
+    const client = makeClient({
+      listDiscoveredServices: vi.fn().mockResolvedValue(ambiguous),
+    });
+
+    let thrown: unknown;
+    try {
+      await runOnboarding(
+        makeInputs({ clusterName: '', systemEnvironmentId: '8bfa188b' }),
+        client,
+        vi.fn(),
+        createCapturingReporter().reporter
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const err = thrown as Error;
+    expect(err.message).toMatch(/resolve discovered-service identity/i);
+    expect(err.message).toMatch(/af-cards-activation/);
+    expect(err.message).toMatch(/ws-123/);
+    expect(err.message).toMatch(/canonical "af-cards-activation"/);
+    expect(err.message).toMatch(/Provide or correct cluster-name/i);
+    expect(err.message).toMatch(/Ambiguous discovered service/i);
+    expect(err.message).not.toMatch(/[\r\n]/);
+    expect(err.cause).toBeInstanceOf(Error);
+    expect((err.cause as Error).message).toMatch(/cluster-name is required/i);
+    expect(client.prepareCollection).not.toHaveBeenCalled();
+    expect(client.onboardGit).not.toHaveBeenCalled();
+    expect(client.resolveProviderServiceId).not.toHaveBeenCalled();
+  });
 });
 
 describe('resolveApiKeyAndTeamId', () => {
@@ -148,7 +288,7 @@ describe('resolveApiKeyAndTeamId', () => {
   it('validates existing API key and derives team ID', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ user: { teamId: 99999 } }),
+      json: async () => ({ user: { teamId: 99999, username: 'ada' } }),
     }) as unknown as typeof fetch;
 
     const client = makeClient();
@@ -161,46 +301,54 @@ describe('resolveApiKeyAndTeamId', () => {
     expect(client.createApiKey).not.toHaveBeenCalled();
   });
 
-  it('creates new API key when provided key is invalid', async () => {
-    let callCount = 0;
-    globalThis.fetch = vi.fn().mockImplementation(async () => {
-      callCount++;
-      if (callCount === 1) {
-        return { ok: false, status: 401, json: async () => ({}) };
-      }
-      return { ok: true, json: async () => ({ user: { teamId: 88888 } }) };
+  it('rejects invalid API key unless create-api-key is opted in', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
     }) as unknown as typeof fetch;
 
     const client = makeClient();
+    await expect(
+      resolveApiKeyAndTeamId(makeInputs({ postmanTeamId: '', createApiKey: false }), client)
+    ).rejects.toThrow(/postman-api-key is invalid|create-api-key/i);
+    expect(client.createApiKey).not.toHaveBeenCalled();
+  });
+
+  it('creates a durable API key only when create-api-key is opted in', async () => {
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({}) })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ user: { teamId: 13347347, username: 'ada' } }),
+      }) as unknown as typeof fetch;
+
+    const client = makeClient();
     const result = await resolveApiKeyAndTeamId(
-      makeInputs({ postmanTeamId: '' }),
+      makeInputs({ postmanTeamId: '', createApiKey: true, projectName: 'payments' }),
       client,
     );
     expect(result.apiKey).toBe('PMAK-generated');
-    expect(client.createApiKey).toHaveBeenCalled();
+    expect(client.createApiKey).toHaveBeenCalledWith('insights-onboarding-payments');
     expect(result.teamId).toBe('');
   });
 
-  it('creates new API key when no key is provided', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ user: { teamId: 77777 } }),
-    }) as unknown as typeof fetch;
-
+  it('rejects missing API key unless create-api-key is opted in', async () => {
     const client = makeClient();
-    const result = await resolveApiKeyAndTeamId(
-      makeInputs({ postmanApiKey: '', postmanTeamId: '' }),
-      client,
-    );
-    expect(result.apiKey).toBe('PMAK-generated');
-    expect(client.createApiKey).toHaveBeenCalled();
-    expect(result.teamId).toBe('');
+    await expect(
+      resolveApiKeyAndTeamId(
+        makeInputs({ postmanApiKey: '', postmanTeamId: '', createApiKey: false }),
+        client,
+      )
+    ).rejects.toThrow(/postman-api-key is required|create-api-key/i);
+    expect(client.createApiKey).not.toHaveBeenCalled();
   });
 
   it('does not require a derived team ID when none is provided', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ user: {} }),
+      json: async () => ({ user: { username: 'ada' } }),
     }) as unknown as typeof fetch;
 
     const client = makeClient();
@@ -214,15 +362,79 @@ describe('resolveApiKeyAndTeamId', () => {
   it('uses explicit postman-team-id when provided', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ user: { teamId: 11111 } }),
+      json: async () => ({ user: { teamId: 11111, username: 'ada' } }),
     }) as unknown as typeof fetch;
 
     const client = makeClient();
+    const { infos, reporter } = createCapturingReporter();
     const result = await resolveApiKeyAndTeamId(
       makeInputs({ postmanTeamId: '55555' }),
       client,
+      reporter
     );
     expect(result.teamId).toBe('55555');
+    expect(infos.some((entry) => entry.includes('55555') && !entry.includes('\n'))).toBe(true);
+  });
+
+  it('wraps createApiKey rejection with sanitized project/key name, cause, and remediation', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+    }) as unknown as typeof fetch;
+
+    const cause = new Error('bifrost create failed');
+    const client = makeClient({
+      createApiKey: vi.fn().mockRejectedValue(cause),
+    });
+    const { infos, reporter } = createCapturingReporter();
+
+    let thrown: unknown;
+    try {
+      await resolveApiKeyAndTeamId(
+        makeInputs({
+          postmanApiKey: 'PMAK-bad',
+          createApiKey: true,
+          projectName: 'pay\rments\napp',
+          postmanTeamId: 'team\r\n-1',
+        }),
+        client,
+        reporter
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const err = thrown as Error;
+    expect(err.message).toMatch(/createApiKey/);
+    expect(err.message).toMatch(/insights-onboarding-pay ments app/);
+    expect(err.message).toMatch(/project "pay ments app"/);
+    expect(err.message).toMatch(/bifrost create failed/);
+    expect(err.message).toMatch(/Verify Bifrost identity access/i);
+    expect(err.message).not.toMatch(/[\r\n]/);
+    expect(err.cause).toBe(cause);
+    expect(client.createApiKey).toHaveBeenCalledWith('insights-onboarding-pay\rments\napp');
+    expect(infos.every((entry) => !/[\r\n]/.test(entry))).toBe(true);
+  });
+
+  it('names the created key and GET /me endpoint when post-create validation fails', async () => {
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({}) })
+      .mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({}) }) as unknown as typeof fetch;
+
+    const client = makeClient({
+      createApiKey: vi.fn().mockResolvedValue('PMAK-generated'),
+    });
+
+    await expect(
+      resolveApiKeyAndTeamId(
+        makeInputs({ postmanApiKey: 'PMAK-bad', createApiKey: true, projectName: 'payments' }),
+        client,
+        createCapturingReporter().reporter
+      )
+    ).rejects.toThrow(/insights-onboarding-payments.*GET https:\/\/api\.getpostman\.com\/me|could not be validated via GET/i);
+    expect(client.createApiKey).toHaveBeenCalledWith('insights-onboarding-payments');
   });
 });
 
@@ -240,7 +452,7 @@ describe('validateApiKey', () => {
   it('returns valid=true with teamId for a good key', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ user: { teamId: 12345 } }),
+       json: async () => ({ user: { teamId: 12345, username: 'ada' } }),
     }) as unknown as typeof fetch;
 
     const result = await validateApiKey('PMAK-good');
@@ -251,7 +463,7 @@ describe('validateApiKey', () => {
   it('defaults to prod /me when no base URL is provided', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ user: { teamId: 12345 } }),
+       json: async () => ({ user: { teamId: 12345, username: 'ada' } }),
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
@@ -262,7 +474,7 @@ describe('validateApiKey', () => {
   it('routes /me through a custom api base URL when provided', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ user: { teamId: 12345 } }),
+       json: async () => ({ user: { teamId: 12345, username: 'ada' } }),
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
@@ -293,88 +505,48 @@ describe('validateApiKey', () => {
   });
 
   it('throws on unexpected HTTP status (e.g. 500)', async () => {
+    const sentinelKey = 'PMAK-sentinel-http-500-key';
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 500,
     }) as unknown as typeof fetch;
 
-    await expect(validateApiKey('PMAK-err')).rejects.toThrow(
-      'API key validation failed with unexpected status 500'
-    );
+    let thrown: unknown;
+    try {
+      await validateApiKey(sentinelKey);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const err = thrown as Error;
+    expect(err.message).toMatch(/API key validation failed for GET https:\/\/api\.getpostman\.com\/me/);
+    expect(err.message).toMatch(/unexpected status 500/);
+    expect(err.message).toMatch(/Verify the Postman API endpoint\/network/i);
+    expect(err.message).not.toContain(sentinelKey);
+    expect(err.message).not.toMatch(/[\r\n]/);
   });
 
   it('throws on network error instead of treating as invalid', async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network')) as unknown as typeof fetch;
+    const sentinelKey = 'PMAK-sentinel-network-key';
+    const cause = new Error(`network failed while using ${sentinelKey}`);
+    globalThis.fetch = vi.fn().mockRejectedValue(cause) as unknown as typeof fetch;
 
-    await expect(validateApiKey('PMAK-err')).rejects.toThrow('network');
-  });
-});
-
-describe('getTeams', () => {
-  let originalFetch: typeof globalThis.fetch;
-
-  beforeEach(() => {
-    originalFetch = globalThis.fetch;
-  });
-
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  it('returns parsed teams from API', async () => {
-    const { getTeams } = await import('../src/index.js');
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: [
-          { id: 1, name: 'Team Alpha', organizationId: 100 },
-          { id: 2, name: 'Team Beta', organizationId: 100 }
-        ]
-      }),
-    }) as unknown as typeof fetch;
-
-    const result = await getTeams('PMAK-test');
-    expect(result).toEqual([
-      { id: 1, name: 'Team Alpha', organizationId: 100 },
-      { id: 2, name: 'Team Beta', organizationId: 100 },
-    ]);
-  });
-
-  it('returns empty array on API error', async () => {
-    const { getTeams } = await import('../src/index.js');
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 500,
-    }) as unknown as typeof fetch;
-
-    const result = await getTeams('PMAK-test');
-    expect(result).toEqual([]);
-  });
-
-  it('returns empty array on network error', async () => {
-    const { getTeams } = await import('../src/index.js');
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network')) as unknown as typeof fetch;
-
-    const result = await getTeams('PMAK-test');
-    expect(result).toEqual([]);
-  });
-
-  it('filters out teams without id or name', async () => {
-    const { getTeams } = await import('../src/index.js');
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: [
-          { id: 1, name: 'Valid Team' },
-          { id: null, name: 'Missing ID' },
-          { id: 2, name: '' },
-          { id: undefined, name: 'Undefined ID' },
-        ]
-      }),
-    }) as unknown as typeof fetch;
-
-    const result = await getTeams('PMAK-test');
-    expect(result).toEqual([{ id: 1, name: 'Valid Team' }]);
+    let thrown: unknown;
+    try {
+      await validateApiKey(sentinelKey);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const err = thrown as Error;
+    expect(err.message).toMatch(/API key validation failed for GET https:\/\/api\.getpostman\.com\/me/);
+    expect(err.message).toMatch(/network failed while using/);
+    expect(err.message).toContain(REDACTED);
+    expect(err.message).not.toContain(sentinelKey);
+    expect(err.message).toMatch(/Verify the Postman API endpoint\/network/i);
+    expect(err.message).not.toMatch(/[\r\n]/);
+    expect(err.cause).toBe(cause);
+    expect((err.cause as Error).message).toContain(sentinelKey);
   });
 });
 
@@ -424,7 +596,7 @@ describe('resolveInputs env var fallbacks', () => {
   });
 });
 
-describe('resolveApiKeyAndTeamId org-mode auto-detection', () => {
+describe('resolveApiKeyAndTeamId never infers team from PMAK', () => {
   let originalFetch: typeof globalThis.fetch;
 
   beforeEach(() => {
@@ -435,12 +607,12 @@ describe('resolveApiKeyAndTeamId org-mode auto-detection', () => {
     globalThis.fetch = originalFetch;
   });
 
-  it('auto-detects org-mode and derives team ID when multiple sub-teams exist', async () => {
-    let callCount = 0;
-    globalThis.fetch = vi.fn().mockImplementation(async () => {
-      callCount++;
-      if (callCount === 1) {
-        // getTeams response - realistic IDs: sub-team IDs distinct from org ID
+  it('leaves team id empty even when /teams returns org-mode sub-teams', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (String(url).endsWith('/me')) {
+        return { ok: true, json: async () => ({ user: { teamId: 10, username: 'ada' } }) };
+      }
+      if (String(url).endsWith('/teams')) {
         return {
           ok: true,
           json: async () => ({
@@ -450,69 +622,39 @@ describe('resolveApiKeyAndTeamId org-mode auto-detection', () => {
             ]
           }),
         };
-      } else {
-        // validateApiKey response - /me returns a sub-team ID, not org ID
-        return {
-          ok: true,
-          json: async () => ({ user: { teamId: 10 } }),
-        };
       }
+      throw new Error(`unexpected ${url}`);
     }) as unknown as typeof fetch;
 
     const client = makeClient();
     const result = await resolveApiKeyAndTeamId(
-      makeInputs({ postmanApiKey: '', postmanTeamId: '' }),
+      makeInputs({ postmanTeamId: '' }),
       client,
     );
-    expect(result.teamId).toBe('10');
+    expect(result.teamId).toBe('');
+    const urls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.endsWith('/teams'))).toBe(false);
   });
 
-  it('auto-detects org-mode and auto-picks team when only one sub-team exists', async () => {
-    globalThis.fetch = vi.fn().mockImplementation(async () => {
-      // getTeams response - single sub-team with org ID
-      return {
-        ok: true,
-        json: async () => ({
-          data: [{ id: 10, name: 'Only Team', organizationId: 999 }]
-        }),
-      };
-    }) as unknown as typeof fetch;
-
-    const client = makeClient();
-    const result = await resolveApiKeyAndTeamId(
-      makeInputs({ postmanApiKey: '', postmanTeamId: '' }),
-      client,
-    );
-    expect(result.teamId).toBe('10');
-  });
-
-  it('does not auto-pick team when /me teamId does not match any sub-team', async () => {
-    let callCount = 0;
-    globalThis.fetch = vi.fn().mockImplementation(async () => {
-      callCount++;
-      if (callCount === 1) {
-        // getTeams response - two sub-teams with org ID
+  it('does not auto-pick a single org-mode sub-team from PMAK', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (String(url).endsWith('/me')) {
+        return { ok: true, json: async () => ({ user: { teamId: 10, username: 'ada' } }) };
+      }
+      if (String(url).endsWith('/teams')) {
         return {
           ok: true,
           json: async () => ({
-            data: [
-              { id: 10, name: 'SubTeam A', organizationId: 999 },
-              { id: 11, name: 'SubTeam B', organizationId: 999 }
-            ]
+            data: [{ id: 10, name: 'Only Team', organizationId: 999 }]
           }),
         };
-      } else {
-        // validateApiKey response - /me returns a team ID not in the sub-teams list
-        return {
-          ok: true,
-          json: async () => ({ user: { teamId: 888 } }),
-        };
       }
+      throw new Error(`unexpected ${url}`);
     }) as unknown as typeof fetch;
 
     const client = makeClient();
     const result = await resolveApiKeyAndTeamId(
-      makeInputs({ postmanApiKey: '', postmanTeamId: '' }),
+      makeInputs({ postmanTeamId: '' }),
       client,
     );
     expect(result.teamId).toBe('');
@@ -556,7 +698,7 @@ describe('credential preflight seam', () => {
       json: async () => ({
         identity: { team, domain: 'session-domain' },
         data: { user: { id: 2, roles: ['admin'] } },
-        consumerType: 'service_account',
+        consumerType: 'user',
       }),
     };
   }
@@ -564,7 +706,7 @@ describe('credential preflight seam', () => {
   it('resolveApiKeyAndTeamId surfaces the validated /me identity for preflight reuse', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ user: { teamId: 13347347 } }),
+      json: async () => ({ user: { teamId: 13347347, username: 'ada' } }),
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
@@ -573,11 +715,20 @@ describe('credential preflight seam', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('rejected PMAK yields no pmak identity and the preflight never FAILs, even under enforce', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 401 }) as unknown as typeof fetch;
-    const resolved = await resolveApiKeyAndTeamId(makeInputs({ postmanTeamId: '55555' }), makeClient());
+  it('validates an explicitly created PMAK before linking', async () => {
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 401 })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ user: { teamId: 13347347, username: 'ada' } })
+      }) as unknown as typeof fetch;
+    const resolved = await resolveApiKeyAndTeamId(
+      makeInputs({ postmanTeamId: '55555', createApiKey: true }),
+      makeClient()
+    );
     expect(resolved.apiKey).toBe('PMAK-generated');
-    expect(resolved.pmakIdentity).toBeUndefined();
+    expect(resolved.pmakIdentity).toEqual({ source: 'pmak/me', teamId: '13347347' });
 
     const { infos, warnings, reporter } = createReporter();
     const preflightFetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -595,7 +746,7 @@ describe('credential preflight seam', () => {
         preflightFetch as unknown as typeof fetch
       )
     ).resolves.toBeUndefined();
-    expect(warnings.some((entry) => entry.includes('cross-check skipped'))).toBe(true);
+    expect(warnings).toHaveLength(0);
     expect(infos.some((entry) => entry.includes('access-token session identity'))).toBe(true);
   });
 
@@ -634,11 +785,46 @@ describe('credential preflight seam', () => {
     expect(infos.some((entry) => entry.includes('credential preflight OK'))).toBe(true);
   });
 
-  it('parsePreflightMode defaults to warn, normalizes case, and rejects unknown values', () => {
-    expect(parsePreflightMode(undefined)).toBe('warn');
-    expect(parsePreflightMode('')).toBe('warn');
+  it('parsePreflightMode defaults to enforce, normalizes case, and rejects unknown values', () => {
+    expect(parsePreflightMode(undefined)).toBe('enforce');
+    expect(parsePreflightMode('')).toBe('enforce');
     expect(parsePreflightMode(' ENFORCE ')).toBe('enforce');
     expect(() => parsePreflightMode('off')).toThrow(/Unsupported credential-preflight/);
     expect(() => parsePreflightMode('strict')).toThrow(/Unsupported credential-preflight/);
+  });
+
+  it('parser invalid-value errors stay one-line with sanitized CR/LF values and remediation', () => {
+    const cases: Array<{ run: () => void; option: RegExp; supported: RegExp }> = [
+      {
+        run: () => parsePreflightMode('off\r\nstrict'),
+        option: /Unsupported credential-preflight "off strict"/,
+        supported: /Supported values: enforce, warn/,
+      },
+      {
+        run: () => parseServiceNotFoundPolicy('maybe\r\nfail'),
+        option: /Unsupported service-not-found-policy "maybe fail"/,
+        supported: /Supported values: fail, warn/,
+      },
+      {
+        run: () => parseCreateApiKey('yes\r\nplease'),
+        option: /Unsupported create-api-key "yes please"/,
+        supported: /Supported values: true, false/,
+      },
+    ];
+
+    for (const entry of cases) {
+      let thrown: unknown;
+      try {
+        entry.run();
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      expect(message).toMatch(entry.option);
+      expect(message).toMatch(entry.supported);
+      expect(message).toMatch(/Provide one of the supported values, then rerun/);
+      expect(message).not.toMatch(/[\r\n]/);
+    }
   });
 });

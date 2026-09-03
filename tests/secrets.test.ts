@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ConsoleReporter } from '../src/cli.js';
-import { HttpError } from '../src/lib/http-error.js';
+import { HttpError } from '@postman-cs/automation-core';
 import {
   __resetIdentityMemo,
   crossCheckIdentities,
@@ -20,8 +20,19 @@ import {
   createSecretMasker,
   redactSecrets,
   sanitizeHeaders,
+  toOneLine,
   type SecretMasker
 } from '../src/lib/secrets.js';
+
+describe('toOneLine', () => {
+  it('replaces CR/LF/control characters, collapses spaces, and trims', () => {
+    expect(toOneLine('  a\nb\r\nc\u0000d\u0085e\u2028f\u2029g  ')).toBe('a b c d e f g');
+    expect(toOneLine('keep   spaced')).toBe('keep spaced');
+    expect(toOneLine(undefined)).toBe('');
+    expect(toOneLine(null)).toBe('');
+    expect(toOneLine(42)).toBe('42');
+  });
+});
 
 describe('secret safety rails', () => {
   it('redacts configured secret values from freeform text', () => {
@@ -78,6 +89,56 @@ describe('secret safety rails', () => {
       statusText: 'Unauthorized',
       url: `https://example.test/resource?token=${REDACTED}`
     });
+  });
+
+  it('collapses CR/LF from HttpError.message while preserving status and cause context', () => {
+    const error = new HttpError({
+      method: 'POST',
+      url: 'https://example.test/resource\r\nX-Injected: yes',
+      status: 502,
+      statusText: 'Bad Gateway',
+      responseBody: 'upstream failed:\nline-two\rcause=token-123',
+      secretValues: ['token-123'],
+      oneLine: true
+    });
+
+    expect(error.message).not.toContain('\r');
+    expect(error.message).not.toContain('\n');
+    expect(error.message).toContain('502');
+    expect(error.message).toContain('Bad Gateway');
+    expect(error.message).toContain('upstream failed');
+    expect(error.message).toContain('line-two');
+    expect(error.message).toContain('cause=');
+    expect(error.message).not.toContain('token-123');
+    expect(error.responseBody).toContain('\n');
+    expect(error.responseBody).toContain('token-123');
+    expect(error.toJSON().responseBody).toContain(`${REDACTED}`);
+    expect(error.toJSON().responseBody).not.toContain('token-123');
+  });
+
+  it('formats credential identity lines as one masked line when backend values contain CR/LF', () => {
+    const secret = 'identity-secret-token-xyz';
+    const mask = createSecretMasker([secret]);
+    const bell = String.fromCharCode(7);
+    const line = formatIdentityLine(
+      {
+        source: 'pmak/me',
+        userId: '1',
+        fullName: `Ada\n${secret}`,
+        teamId: '10490519',
+        teamName: 'jared\rdemo',
+        teamDomain: `domain${bell}value`
+      },
+      mask
+    );
+
+    expect(line).not.toContain('\r');
+    expect(line).not.toContain('\n');
+    expect(line).not.toContain(bell);
+    expect(line).not.toContain(secret);
+    expect(line).toContain(REDACTED);
+    expect(line).toContain('10490519');
+    expect(line).toContain('postman: PMAK identity');
   });
 });
 
@@ -175,12 +236,12 @@ async function collectDiagnosticLines(mask: SecretMasker): Promise<string[]> {
   const happyFetch = (async (input: RequestInfo | URL) =>
     String(input).endsWith('/me')
       ? preflightJson({
-          user: { id: 1, fullName: 'Ada Lovelace', teamId: 10490519, teamName: 'jared-demo' }
+          user: { id: 1, username: 'ada', fullName: 'Ada Lovelace', teamId: 10490519, teamName: 'jared-demo' }
         })
       : preflightJson({
           identity: { team: 13347347, domain: 'field-services-v12-demo' },
           data: { user: { id: 2, roles: ['collection-editor'] } },
-          consumerType: 'service_account'
+          consumerType: 'user'
         })) as typeof fetch;
   const failingFetch = (async () => preflightJson({ error: 'denied' }, 404)) as typeof fetch;
 
@@ -196,16 +257,20 @@ async function collectDiagnosticLines(mask: SecretMasker): Promise<string[]> {
     fetchImpl: happyFetch
   });
   __resetIdentityMemo();
-  await runCredentialPreflight({
-    apiBaseUrl: API_BASE,
-    iapubBaseUrl: IAPUB_BASE,
-    postmanApiKey: 'pmak-style-2',
-    postmanAccessToken: 'token-style-2',
-    mode: 'warn',
-    mask,
-    log,
-    fetchImpl: failingFetch
-  });
+  try {
+    await runCredentialPreflight({
+      apiBaseUrl: API_BASE,
+      iapubBaseUrl: IAPUB_BASE,
+      postmanApiKey: 'pmak-style-2',
+      postmanAccessToken: 'token-style-2',
+      mode: 'warn',
+      mask,
+      log,
+      fetchImpl: failingFetch
+    });
+  } catch (error) {
+    lines.push(error instanceof Error ? error.message : String(error));
+  }
   __resetIdentityMemo();
   await runCredentialPreflight({
     apiBaseUrl: API_BASE,
@@ -338,13 +403,13 @@ describe('CLI ConsoleReporter masking path (AC7)', () => {
         const url = String(input);
         if (url.endsWith('/me')) {
           return preflightJson({
-            user: { id: 1, teamId: 10490519, teamName: 'jared-demo' }
+            user: { id: 1, username: 'ada', teamId: 10490519, teamName: 'jared-demo' }
           });
         }
         return preflightJson({
           identity: { team: 10490519, domain: 'jared-demo' },
           data: { user: { id: 2, roles: ['admin'], token: FAKE_TOKEN } },
-          consumerType: 'service_account',
+          consumerType: 'user',
           token: FAKE_TOKEN
         });
       }) as typeof fetch;
